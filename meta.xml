@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+    <name>Wii GB Operator</name>
+    <coder>Turtlemon + Claude Code</coder>
+    <version>1</version>
+    <release_date>20260719</release_date>
+    <short_description>GB Operator USB hardware test</short_description>
+    <long_description>A homebrew program that uses the GB operator in tandem with the wii build of mGBA. Play games, manage roms and saves, use custom borders. Program has been almost exclusively tested with Pokemon games as I designed the program in support of a Pokemon Box style project I want to make.</long_description>
+</app>

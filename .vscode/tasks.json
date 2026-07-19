@@ -1,0 +1,54 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cmake: configure",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-B", "build",
+                "-G", "Unix Makefiles",
+                "-DCMAKE_TOOLCHAIN_FILE=${env:DEVKITPRO}/cmake/Wii.cmake"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "cmake: build",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--build", "build", "--", "-j4"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "copy to SD",
+            "type": "shell",
+            "command": "Copy-Item",
+            "args": [
+                "build/wii_gb_operator.dol",
+                "${input:sdDrive}/apps/wii_gb_operator/boot.dol",
+                "-Force"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "sdDrive",
+            "type": "promptString",
+            "description": "SD card drive letter (e.g. E:)"
+        }
+    ]
+}

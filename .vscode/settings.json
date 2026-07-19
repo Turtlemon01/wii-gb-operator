@@ -1,0 +1,9 @@
+{
+    "cmake.configureArgs": [
+        "-DCMAKE_TOOLCHAIN_FILE=${env:DEVKITPRO}/cmake/Wii.cmake"
+    ],
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.generator": "Unix Makefiles",
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "terminal.integrated.cwd": "${workspaceFolder}"
+}
