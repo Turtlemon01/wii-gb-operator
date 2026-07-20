@@ -1,3 +1,5 @@
+https://www.youtube.com/watch?v=tazmWO59ijw
+
 AI Disclaimer:
 I am not a software engineer and my only coding experience is 2 coding classes in school almost 4 years ago. I used Claude Code to support effectively all coding requirements while I managed decision making, direction, and troubleshooting. I also synthesized from many other projects that I was deliberate about crediting below. I am not affiliated with anyone credited nor do I, have I, or will I receive money for this project. I just like homebrew projects and hoped to contribute to the community. 
 
