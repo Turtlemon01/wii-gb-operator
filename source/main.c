@@ -1493,6 +1493,16 @@ int main(int argc, char **argv) {
     printf("===============\n\n");
     printf("Starting up...\n");
 
+    /* Reset the USB host controller unconditionally before any USB operations.
+     * On d2x-cIOS Wiis, HBC can leave OH0 in a stale state where writes appear
+     * to succeed (tx=64) but reads return -7008.  This affects both SD-boot and
+     * USB-boot users, so the reset must run regardless of where the app lives.
+     * Safe here — SD uses SDIO, not USB; SD mount happens after this returns. */
+    printf("Resetting USB host...\n");
+    USB_Deinitialize();
+    USB_Initialize();
+    usleep(2000000);  /* 2s for GB Operator to re-enumerate on the clean bus */
+
     // Mount SD only — fatInitDefault also starts a USB mass storage driver
     // which can interfere with USB device enumeration for the GB Operator.
     // Retry up to 3 times in case the SD slot needs a moment after boot.
@@ -1531,17 +1541,9 @@ int main(int argc, char **argv) {
     settings_load();
 
     /* Phase 2: USB mass storage — only when SD did not have the app dir.
-     * For USB-boot users, HBC leaves the USB host controller in a stale state
-     * (d2x-cIOS issue) that causes USB_OpenDevice to return garbage fds.
-     * We reset the USB host BEFORE mounting USB storage so the storage driver
-     * initialises on a clean bus. gbop_find() must NOT repeat this reset after
-     * storage is mounted — USB_Deinitialize would close the shared OH0 handle
-     * that the storage driver depends on, breaking log writes and ROM/save I/O. */
-    if (!sd_has_app_dir) {
-        USB_Deinitialize();
-        USB_Initialize();
-        usleep(2000000);  /* 2s for GB Operator to re-enumerate on the clean bus */
-    }
+     * USB reset already ran unconditionally above; fatMountSimple runs on a
+     * clean bus.  Do NOT reset USB again here — USB_Deinitialize would close
+     * the shared OH0 handle the storage driver depends on, breaking file I/O. */
     if (!sd_has_app_dir) {
         if (fatMountSimple("usb", &__io_usbstorage)) {
             printf("[OK]  USB storage mounted\n");
