@@ -13,6 +13,11 @@ extern FILE *g_log;
  * The console shares xfb with GX; writing to it during emulation corrupts video. */
 extern int g_log_suppress_console;
 
+/* App directory root — set at startup by main() based on which drive has the
+ * apps/wii-gb-operator folder: "sd:/apps/wii-gb-operator" or "usb:/apps/wii-gb-operator".
+ * All modules derive their file paths from this. */
+extern char g_app_root[32];
+
 static inline void lprintf(const char *fmt, ...) {
     va_list args;
     if (!g_log_suppress_console) {

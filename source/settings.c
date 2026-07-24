@@ -6,10 +6,10 @@
 
 WiiGBSettings g_settings = { .scale_gba = 0.8f, .scale_gba_border = 1.0f, .scale_gb = 0.8f, .dev_menu = 0 };
 
-#define SETTINGS_PATH "sd:/apps/wii-gb-operator/settings.ini"
-
 void settings_load(void) {
-    FILE *f = fopen(SETTINGS_PATH, "r");
+    char settings_path[64];
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.ini", g_app_root);
+    FILE *f = fopen(settings_path, "r");
     if (!f) {
         lprintf("[settings] not found — using defaults (scale_gba=%.1f scale_gba_border=%.1f scale_gb=%.1f)\n",
                 (double)g_settings.scale_gba, (double)g_settings.scale_gba_border, (double)g_settings.scale_gb);

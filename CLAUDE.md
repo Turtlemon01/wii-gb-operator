@@ -12,14 +12,18 @@ All-in-one Wii homebrew app that reads GB/GBC/GBA cartridges from the Epilogue G
 
 ### Future Plans
 - Pokémon Box-style save management UI
-- GameCube-to-GBA link cable adapter support (see Phase 4, item 5)
+- Link cable support: DOL-011 JoyBus path (GC↔GBA games) and Wi-Fi software link (general GBA/GB trading) — see Phase 4 item 5
 
 ### Phase 4 Plans (implementation order)
 1. **Settings file** ✓ COMPLETE — `sd:/apps/wii-gb-operator/settings.ini` (plain-text key=value). Parsed by `source/settings.c`; loaded once after SD mount. Keys: `scale_gba` (float, GBA display scale), `scale_gb` (float, GB/GBC display scale), `dev_menu` (int: 0=hidden, 1=show Developer Menu in frontend). Copy `settings.ini` from repo root to SD card to apply.
 2. **GB/C manual sync only** — remove auto-save detection for GB/GBC; replace with manual "Sync to Cart" workflow only. OSD exit prompt asks whether to sync before leaving. Player can choose not to sync to reset to last save point. GBA auto-sync unchanged. Simplifies existing code before adding new features.
 3. **GBA borders** ✓ COMPLETE — composite a decorative border frame around the GBA game. Canvas size: **320×240** (4:3, 40px margin all around the 240×160 game area). File format: **8-bit indexed, 24-bit, or 32-bit uncompressed BMP, exactly 320×240**, stored in `sd:/apps/wii-gb-operator/borders/gba/border_<4-char-game-code>.bmp`. Game renders at pixel offset (40, 40) within the canvas. Scale setting `scale_gba_border` (default 1.0) is used when a border is loaded; `scale_gba` (default 0.8) is used when no border file is present. 8bpp indexed format confirmed working with Aseprite exports (test_118). Example filenames: `border_BPRE.bmp` (FireRed), `border_AXVE.bmp` (Sapphire).
-4. **Save sync animation icons** — replace the 8×8 colored dot with a 2-frame animated sprite. File format: **24-bit uncompressed BMP, exactly 32×32 pixels**, three files in `sd:/apps/wii-gb-operator/icons/`: `sync_0.bmp` (frame 0 — floppy disk at rest), `sync_1.bmp` (frame 1 — floppy disk slightly offset, creates bobbing animation), `sync_done.bmp` (floppy with checkmark, shown on sync success). Frames alternate every ~30 frames while sync is in progress. GBA only (GBC uses OSD manual sync).
-5. **GC→GBA link cable** — use the GameCube-to-GBA link cable connected to the Wii's GameCube port to trade Pokémon between the emulated GBA game and a physical GBA. Long-term goal; implement after all other Phase 4 items are complete and stable.
+4. **Save sync animation icons** — replace the 8×8 colored dot with a 2-frame animated sprite. File format: **32bpp BGRA uncompressed BMP (BI_BITFIELDS, compression=3, or comp=0), exactly 16×16 pixels**, three files in `sd:/apps/wii-gb-operator/icons/`: `sync_0.bmp` (frame 0 — floppy disk at rest), `sync_1.bmp` (frame 1 — floppy disk slightly offset, creates bobbing animation), `sync_done.bmp` (floppy with checkmark, shown on sync success). Alpha channel used directly (A=0 = transparent pixel skipped). Frames alternate every ~30 frames while sync is in progress. GBA only (GBC uses OSD manual sync). Pixel data offset 70 for BI_BITFIELDS BMPs (Aseprite export format). Fallback to 8×8 colored dot when files absent.
+5. **Link cable support** *(DEFERRED — research pinned for future implementation)* — three sub-tracks, all long-term:
+   - **Colosseum/XD middleman** *(highest priority sub-track)*: Gen 3 Pokémon trading between the emulated GBA game (mGBA, on Wii) and a physical GBA handheld connected via DOL-011 cable. The Wii acts as a fake Colosseum/XD GCN host: it sends the `colosseum-mb` multiboot ROM to the physical GBA via JoyBus (`SI_Transfer`), receives the physical GBA's party data, presents a trade OSD on the TV, and brokers the swap. **The physical GBA never runs its retail game during the trade** — colosseum-mb runs from GBA RAM, reads the physical cart save directly, shows its own trade UI on the GBA screen, and writes the received Pokémon back to the cart save. The mGBA player uses the GC controller on the TV OSD; the physical GBA player uses their GBA buttons (transmitted back to the Wii via `LINK_CMD_READ_INPUT`). No physical cart swapping; no Cable Club; both players interact simultaneously. **Rejected alternative**: a "save-swap" approach (cart physically inserted into GB Operator, save read/written over USB, no cable) was considered but rejected — it requires swapping the cartridge out of the GBA handheld and doesn't feel like a trade. **DOL-011 hardware note**: the cable carries only the SD/JoyBus pin — NOT SO, SI, or SC (GBA multiplayer SIO pins). Full GBA-to-GBA link cable (trading, battling) is physically impossible over DOL-011; the Colosseum middleman works only because colosseum-mb uses JoyBus, not SIO. **Key rules enforced by the middleman** (from pret/pokefirered `CanTradeSelectedMon()`): party must have ≥2 non-egg Pokémon after trade; Mew/Deoxys require MODERN_FATEFUL_ENCOUNTER (bit 31 of Misc Ribbons/Obedience u32); FRLG requires `FLAG_SYS_CAN_LINK_WITH_RS` (0x844); Egg trading requires both players to have `FLAG_SYS_NATIONAL_DEX` (0x840); Pokémon holding mail cannot trade; Enigma Berry blocks trade entirely. **Game-of-origin note**: traded Pokémon should have bits 7–10 of Origins Info set to 15 (Colosseum/XD) to explain why they crossed between GBA games without normal link-cable validation. **Save format**: party in Section 1 at offset 0x0038 (FRLG) or 0x0238 (RSE); 100-byte Pokémon slots × 6; 48-byte block XOR-encrypted with full OT ID u32; per-Pokémon checksum = sum of 24 u16 words in decrypted block (low 16 bits); per-section checksum = sum all u32 words in section data, add upper+lower u16 halves, take low 16 bits. **Protocol status — what is known**: GBA-side fully decompiled (pret/colosseum-mb); multiboot send on Wii already implemented (Wack0/gba-gen3multiboot); JoyBus transport layer known (GBATEK + Dolphin SI_DeviceGBA); LINK_CMD_* function names and behavior known from pret/colosseum-mb `payload/src/unk_200C5DC.c`. **Protocol status — what is unknown**: exact LINK_CMD_* byte values; GCN-side command send sequence and state machine (no Colosseum decomp exists). **One-session fix**: run Dolphin + Colosseum/XD ISO + mGBA connected via JoyBus TCP (Dolphin settings → GBA), capture port 54970 in Wireshark, complete one trade — this gives every GCN-side byte value and ordering needed to implement the middleman.
+   - **DOL-011 JoyBus path**: The GameCube-to-GBA cable (DOL-011) connects only the SD pin (JoyBus protocol). It does NOT carry standard GBA multiplayer SIO (SO/SI/SC) and cannot be used for GBA-to-GBA trading. It IS usable for games that explicitly support GC↔GBA connectivity (FireRed/LeafGreen ↔ Pokémon Box/Colosseum, e-Reader). Implementation: adapt `vendor/mgba/src/gba/sio/dolphin.c` — a JoyBus SIO driver that currently uses TCP sockets for Dolphin emulator — replacing TCP with libogc `SI_Transfer` calls. Register via `GBASIOSetDriver(&gba->sio, &driver, SIO_JOYBUS)`.
+   - **Wi-Fi software link**: For real-time GBA-to-GBA and GB/GBC-to-GB/GBC link cable (trading, battling, union room, co-op), the correct approach is software-to-software over Wii Wi-Fi. Two Wiis each running wii-gb-operator link their mGBA instances via libogc TCP sockets, using mGBA's `GBASIOLockstepDriver` (GBA) and `GBSIODriver` (GB/GBC) for byte-level synchronization. Covers all game types, no extra hardware required.
+   - Implement after all other Phase 4 items are complete and stable.
 
 ---
 
@@ -53,7 +57,7 @@ All-in-one Wii homebrew app that reads GB/GBC/GBA cartridges from the Epilogue G
 - GX double-buffer rendering; `g_gx_initialized` guard prevents double `GX_Init` on successive sessions
 
 ### What is in progress (Phase 4)
-- **Save sync animation icons** — replace 8×8 colored dot with 2-frame animated floppy-disk sprite (32×32 BMP). Files: `sync_0.bmp`, `sync_1.bmp`, `sync_done.bmp` in `sd:/apps/wii-gb-operator/icons/`. Frames alternate every ~30 frames during sync; done icon shown on success. GBA only.
+- **Save sync animation icons** — replace 8×8 colored dot with 2-frame animated floppy-disk sprite (16×16 32bpp BGRA BMP). Files: `sync_0.bmp`, `sync_1.bmp`, `sync_done.bmp` in `sd:/apps/wii-gb-operator/icons/`. Frames alternate every ~30 frames during sync; done icon shown on success. GBA only. Code implemented in `source/mgba_frontend.c` (`load_icon_bmp`, `blit_icon`, `draw_save_indicator`); needs hardware test.
 - **GC→GBA link cable** — long-term; implement after all other Phase 4 items complete
 
 ### Hardware test findings (2026-06-13)
@@ -440,7 +444,26 @@ All external sources consulted during development are listed here. **This sectio
 | DevKitPro | https://devkitpro.org | Wii/GameCube homebrew toolchain (devkitPPC compiler, CMake integration). |
 | libogc | https://github.com/devkitPro/libogc | Wii runtime library. Provides USB bulk transfer APIs (`USB_GetDeviceList`, `USB_OpenDevice`, `USB_WriteBlkMsg`, `USB_ReadBlkMsg`, `USB_WriteCtrlMsg`, `USB_CloseDevice`), DMA cache coherency macros (`DCFlushRange`, `DCInvalidateRange`), video, and controller input. |
 | libfat | https://github.com/devkitPro/libfat | FAT filesystem driver for SD and USB mass storage. Used for all SD file I/O (`fatMountSimple`, stdio `fopen`/`fwrite`/`fclose`). |
-| mGBA | https://github.com/mgba-emu/mgba | Game Boy / GBC / GBA emulator. Vendored at `vendor/mgba/` as the Phase 3 emulation core. API used: `mCoreFind`, `mCoreCreate`, `mCoreLoadFile`, `mCoreCallbacks.savedataUpdated`, `blip_buf` audio ring buffer, GBA/GB core headers. |
+| mGBA | https://github.com/mgba-emu/mgba | Game Boy / GBC / GBA emulator. Vendored at `vendor/mgba/` as the Phase 3 emulation core. API used: `mCoreFind`, `mCoreCreate`, `mCoreLoadFile`, `mCoreCallbacks.savedataUpdated`, `blip_buf` audio ring buffer, GBA/GB core headers. Link cable design: `include/mgba/gba/interface.h` (`struct GBASIODriver`, `GBASIOSetDriver`), `include/mgba/internal/gba/sio.h` (`struct GBASIODriverSet`, `SIO_JOYBUS` enum), `include/mgba/gb/interface.h` (`struct GBSIODriver`, `GBSIOSetDriver`), `src/gba/sio/dolphin.c` (JoyBus TCP driver — template for SI_Transfer adaptation), `src/gba/sio/lockstep.c` (multiplayer lockstep — template for Wi-Fi link), `src/gb/sio/lockstep.c` (GB lockstep). |
+| mGBA SIO dolphin driver | https://github.com/mgba-emu/mgba/blob/master/src/gba/sio/dolphin.c | mGBA's JoyBus SIO driver for Dolphin emulator connectivity. Uses two TCP sockets (clock port 49420, data port 54970) and processes JoyBus commands 0xFF/0x00/0x14/0x15 via `GBASIOJOYSendCommand`. Direct template for the DOL-011 hardware JoyBus path: replace TCP with libogc `SI_Transfer`. |
+| gba-link-cable-rom-sender | https://github.com/FIX94/gba-link-cable-rom-sender | Wii homebrew that uses SI_Transfer to send GBA ROM data via JoyBus over DOL-011. Reference for libogc SI_Transfer call patterns (command buffer layout, `SI_GetTypeAsync` for GBA detection, 50µs inter-command delay). |
+| afska/gba-link-connection | https://github.com/afska/gba-link-connection | GBA-side link cable library. `LinkCube.hpp` documents the GBA JoyBus slave register interface: RCNT bits 14–15=1 to enter joybus mode, REG_JOYCNT (0x4000140), REG_JOYSTAT (0x4000158), JOY_RECV_L/H (0x4000150/52), JOY_TRANS_L/H (0x4000154/56). Confirms GBA is always slave in JoyBus. |
+| GBATEK SIO JoyBus | https://problemkaputt.de/gbatek-sio-joy-bus-mode.htm | Hardware reference for the GBA JoyBus register interface and protocol. JoyBus command byte encoding (0xFF reset, 0x00 poll, 0x14 read 4B, 0x15 write 4B), 32-bit transfer format, and RCNT/JOYCNT register semantics. |
+| Pan Docs Serial Transfer | https://gbdev.io/pandocs/Serial_Data_Transfer_(Link_Cable).html | Reference for GB/GBC SIO protocol: 8-bit transfers, $FF01 (SB data) and $FF02 (SC control) registers, master/slave clock selection, transfer timing (512 cycles normal / 16 cycles GBC high-speed). Informs `GBSIODriver.writeSB`/`writeSC` hook design. |
+| Celio-Client | https://github.com/Celio-Link/Celio-Client | Online Pokémon Gen 3 trading client (browser-side). Uses WebUSB/WebSerial to talk to Celio-Firmware dongle. Network protocol to Celio-Server not published. Consulted for architecture reference only; not directly adaptable to Wii. |
+| Celio-Firmware | https://github.com/Celio-Link/Celio-Firmware | RP2040 firmware for the Celio-Link custom dongle. Connects to a physical GBA via AGB-005 link cable (SO/SI/SC pins — GBA multiplayer SIO, NOT JoyBus). Targets Gen 3 GBA Pokémon only. Reference for understanding GBA multiplayer SIO signal requirements. Not compatible with DOL-011 (which uses only SD/JoyBus). |
+| pret/pokefirered | https://github.com/pret/pokefirered | FRLG decompilation. Primary reference for trade legality rules (`src/trade.c` `CanTradeSelectedMon()`), flag constants (`include/constants/flags.h`: `FLAG_SYS_NATIONAL_DEX`=0x840, `FLAG_SYS_CAN_LINK_WITH_RS`=0x844), and FRLG save layout (party at Section 1 offset 0x0038, 100 bytes/slot, 6 slots). Confirms National Dex and Celio quest are independent flags. |
+| pret/pokeemerald | https://github.com/pret/pokeemerald | RSE decompilation. Cross-reference for `CanTradeSelectedMon()` (same trade rules as FRLG), RSE party offset (Section 1 offset 0x0238), and save section layout. |
+| Bulbapedia Pokémon data structure Gen III | https://bulbapedia.bulbagarden.net/wiki/Pok%C3%A9mon_data_structure_(Generation_III) | Authoritative reference for the 100-byte GBA party Pokémon structure: 32-byte outer header (PV, OT ID, nickname 10B, OT name 7B, marks, language, bad egg/obedience, checksum), 48-byte XOR-encrypted block (key = full OT ID u32). Four 12-byte substructures in permutation order `PV % 24`. Growth substructure: species, item, XP, friendship. Attacks: moves + PP. EVs/Condition: EVs, contest. Misc: Origins Info (game-of-origin bits 7–10; 15=Colosseum/XD), IVs/Egg/Ability (bit 30 = Egg flag, bit 31 = MODERN_FATEFUL_ENCOUNTER). Per-Pokémon checksum: sum of all 24 u16 words in decrypted 48-byte block, take low 16 bits. |
+| Bulbapedia Save data structure Gen III | https://bulbapedia.bulbagarden.net/wiki/Save_data_structure_(Generation_III) | Gen 3 save file layout: 128KB Flash, two alternating 57,344-byte save slots, 14 sections × 4,096 bytes each. Section structure: 3,968-byte data area, section ID (u16), checksum (u16), validation (u32=0x08012025), save index (u32). Per-section checksum: sum all u32 words in data; add upper and lower u16 halves of 32-bit result; take low 16 bits. Party data in Section 1 (ID=1): FRLG offset 0x0038, RSE offset 0x0238. |
+| Bulbapedia Pokémon Colosseum | https://bulbapedia.bulbagarden.net/wiki/Pok%C3%A9mon_Colosseum | Reference for Colosseum GBA trade rules: requires completion of Story Mode, trade via Pokémon Center in Phenac City basement, Shadow Pokémon must be fully purified before they can be traded to GBA, Eggs cannot be sent to or received from GCN games, English GCN ↔ English GBA language restriction. |
+| Bulbapedia Pokémon XD | https://bulbapedia.bulbagarden.net/wiki/Pok%C3%A9mon_XD:_Gale_of_Darkness | Reference for XD GBA trade rules (same as Colosseum). Purification and MODERN_FATEFUL_ENCOUNTER requirements for Shadow Pokémon. |
+| pret/colosseum-mb | https://github.com/pret/colosseum-mb | Full C decompilation of the GBA-side multiboot ROM that Colosseum/XD sends to the GBA during a trade. This is the primary reference for the JoyBus trade protocol GBA side. Key file: `payload/src/unk_200C5DC.c` — implements `JoyBusVCOuntIntr`, all LINK_CMD_* handlers (`LINK_CMD_RESET`, `LINK_CMD_READ_INPUT`, `LINK_CMD_TRAN_PLAYER_DATA1/2`, `LINK_CMD_RECV_TEXT`, `LINK_CMD_RECV_MON_DATA`, `LINK_CMD_RECV_PARTY_MON`, `LINK_CMD_RECV_GIFT_DATA`, `LINK_CMD_TRAN_GIFT_DATA`, `LINK_CMD_SOFT_RESET`). GBA JoyBus slave setup: `REG_RCNT = 0xC000` (bits 14–15 = JoyBus mode), `REG_JOYCNT |= JOYCNT_IRQ_ENABLE`. Game type detection: reads ROM header at 0x80000AC to distinguish FRLG vs RSE, selects party save offset accordingly. colosseum-mb reads the physical cart save directly via `agb_flash.c`/`libpmagb`, not via the retail game. **The retail GBA game is NOT running during a Colosseum/XD trade.** |
+| Wack0/gba-gen3multiboot | https://github.com/Wack0/gba-gen3multiboot | Wii/GC homebrew that sends the Gen3 multiboot ROM to a GBA via SI_Transfer. Implements the full multiboot key exchange algorithm. Usable as a template for sending colosseum-mb from the Wii to a physical GBA over DOL-011. Note: key derivation occasionally fails; may need retry loop. |
+| hatkirby/gen3uploader | https://github.com/hatkirby/gen3uploader | Wii homebrew using Gen3 multiboot (same SI_Transfer approach as Wack0). More reliable implementation; "works within a few tries." Second reference for multiboot send patterns. |
+| Dolphin SI_DeviceGBA | https://github.com/dolphin-emu/dolphin/blob/master/Source/Core/Core/HW/SI/SI_DeviceGBA.cpp | Dolphin's emulated GCN-side JoyBus device implementation. Uses TCP sockets (clock port 49420, data port 54970) to forward JoyBus commands to mGBA. Running Dolphin + Colosseum ISO + mGBA and capturing port 54970 with Wireshark would reveal the exact GCN-side LINK_CMD byte values and command sequence — the primary remaining unknown for the middleman implementation. |
+| Deokishisu GC link requirements | https://gist.github.com/Deokishisu/c9abef7d41dbd898194197c2509c62fd | Documents which in-game flags the GBA game must have set for GCN link features to work. XD specifically requires `FLAG_SYS_GAME_CLEAR` from the GBA side in addition to the Colosseum requirements. |
+| AxioDL/jbus | https://github.com/AxioDL/jbus | JoyBus TCP server library (same protocol as Dolphin, port 54970). Alternative reference for the Dolphin ↔ GBA TCP data format. |
 
 ---
 
@@ -614,3 +637,119 @@ The cart sync thread owns the GB Operator handle exclusively during upload. The 
 - Read a save immediately after writing without a close/reopen cycle and appropriate delay — the device is not ready for a new command until the USB handle is cycled; attempting a read on the same open handle after a write causes an indefinite `USB_ReadBlkMsg` hang. GBC needs 200ms delay after reopen; GBA needs 30s for Flash erase+program.
 - Call `log_commit_sd()` (fclose+fopen on g_log) from the emulation loop or anywhere while the cart_sync LWP thread is alive — fclose frees the FILE's internal stdio buffer while the sync thread may be inside vfprintf on the same FILE, causing a heap use-after-free that corrupts the malloc free list and causes future malloc calls to hang. Use `log_force_flush()` (fflush only) during emulation.
 - **Use any external source (repository, documentation, specification, or web resource) to inform implementation without first adding it to the Sources table.** This applies to protocol details, API behavior, hardware specs, and reference implementations — not to general language/stdlib knowledge.
+
+---
+
+## Pokémon Box Wii (PBW)
+
+A separate homebrew project that grew out of wii-gb-operator. PBW provides Pokémon Box-style save management for Gen 1–3 games running on the Wii via the GB Operator. It is developed in its own GitHub repository (`pokemon-box-wii`) and must NOT be merged into or built from the wii-gb-operator repository. The wii-gb-operator repo is archived (hardware-verified, complete) and is never modified by PBW work.
+
+**SD path:** `sd:/apps/pokemon-box-wii/`
+
+### Main Menu
+
+Three options on boot:
+1. **Box** — open the box management UI (primary feature)
+2. **Adventure** — boot a specific game from PBW storage (plays via mGBA integration; player has access to their full PBW box storage during the session)
+3. **Options** — display scale, storage device preference, and other settings
+
+### Box Storage Structure
+
+- **14 PBW boxes**, each holding 30 Gen 3 Pokémon slots = 420 total
+- Boxes are displayed as **7 pairs** (two visible at a time); L/R cycles through pair index 0–6
+- Gen 1 and Gen 2 Pokémon are stored separately in Gen 2 format boxes (20-slot boxes); they live in their own storage pool pending PCCS migration to Gen 3
+- The cart row at the bottom of the Box screen shows up to 30 Pokémon currently in the connected cartridge (read via GB Operator) using animated icon sprites
+
+**Subsidiary saves (PBW box persistence):** PBW boxes are stored as blank Emerald saves (PKHeX-compatible), 14 boxes × 30 = 420 slots per file. File: `sd:/apps/pokemon-box-wii/saves/pbw_main.sav`. Any PKHeX-compatible Gen 3 tool can read or validate this file directly.
+
+### Box Screen Layout (GX framebuffer — 640px wide)
+
+- **32px safe-area buffer** on all sides (Wii overscan)
+- **Controls bar at top:** L/R pair navigation with "Pair X/7" label; hint badges for A (context menu), X (grab mode), Y (quick move); **Save & Exit** button top-right (no Cancel button)
+- **Two 6×5 PBW boxes** side by side below the controls bar (30 slots each, `aspect-ratio:1` slots)
+- **Box header** for each: box name (click to rename inline) + "Box X/14" counter. No navigation arrows on the headers — L/R on the controls bar handles all pair cycling.
+- **"Stored XXX/420"** total count shown below or adjacent to box pair
+- **Cart icon row** at the bottom: animated icon sprites (2-frame canvas animation, 500ms toggle) from the connected cartridge or selected save file
+
+### Slot Interaction Model
+
+- **Single-click** to pick up a Pokémon (sets `selected`; slot highlights)
+- **Single-click on destination** to place or swap (atomically swaps slot contents; marks `dirty = true`)
+- **Right-click** opens a context menu with: **Move** (pick up), **Summary** (show summary panel). No Migrate option; no Sort Box option.
+- **Summary panel:** shows full battle sprite + Level, Nature, OT, ID No.
+- **Sprite transition:** Pokémon in the cart row use animated icon sprites. When picked up (selected), the cursor display transitions to the full-size battle sprite.
+
+### Inline Box Rename
+
+Clicking a box name converts it to an `<input>` field in place. Enter confirms, Escape cancels, blur confirms. Name is bound to `boxNames[pairIdx*2]` or `boxNames[pairIdx*2+1]`. Names persist to the subsidiary save file header or a separate metadata file.
+
+### Dirty State and Save & Exit
+
+- `dirty = true` on any slot swap or box rename
+- **Save & Exit:** if `dirty`, shows an "unsaved changes" confirmation modal before exiting. No background auto-save; the player must confirm Save & Exit to commit changes.
+- No Cancel button — the only exit path is Save & Exit (saves and exits) or the modal's "go back" option.
+
+### Sprite Naming Conventions
+
+All sprite files live in `sprites/` at the repo root. Names are **UPPERCASE** with `.png` extension.
+
+| Folder | Content | Frame format |
+|--------|---------|-------------|
+| `sprites/gen3/` | Full battle sprites, Gen 3 | Single frame |
+| `sprites/gen3-shiny/` | Shiny full battle sprites, Gen 3 | Single frame |
+| `sprites/gen2/` | Full battle sprites, Gen 2 | Single frame |
+| `sprites/gen2-shiny/` | Shiny full battle sprites, Gen 2 | Single frame |
+| `sprites/gen3-Icons/` | Icon sprites, Gen 3 | 2 frames **horizontal** (frame 0 left, frame 1 right; split at `naturalWidth/2`) |
+| `sprites/gen2-Icons/` | Icon sprites, Gen 2 | 2 frames **vertical** (frame 0 top, frame 1 bottom; split at `naturalHeight/2`) — **folder currently empty** |
+
+**Gen 2 icon download:** `https://github.com/cRz-Shadows/Pokemon_Crystal_Legacy/tree/main/gfx/icons`
+
+Icon animation renders via `<canvas>` (48×48 display). Every 500ms, `frame` toggles 0↔1 and `drawImage` redraws with the correct x-offset (gen3: `frame * naturalWidth/2`) or y-offset (gen2: `frame * naturalHeight/2`). `imageSmoothingEnabled = false` for pixel-accurate rendering.
+
+### PCCS Legal Mode — Gen 2 → Gen 3 Conversion
+
+This is a one-way migration only (no Gen 3 → Gen 2 conversion is planned). **Legal** is the preferred standard (not Faithful) — the goal is a Pokémon that is legal in Gen 3 without requiring exact reproduction of Gen 2 internal values.
+
+PCCS Legal mode is not yet implemented in the upstream PCCS project; PBW will implement from the spec below.
+
+**PID generation (LCRNG loop):**
+1. Generate a candidate PID via LCRNG.
+2. Accept if `PID % 25 == target_nature` (nature determination).
+3. Accept if gender DV threshold satisfied: gender ratio byte from species data; female if `DV_ATK % 8 < ratio_threshold`, male otherwise — PID gender bit must match Gen 2 gender.
+4. Accept if ability bit (PID bit 0) matches desired ability.
+5. For Unown: accept if `((PID >> 28 & 3) << 6 | (PID >> 24 & 3) << 4 | (PID >> 20 & 3) << 2 | (PID >> 16 & 3)) >> 2` matches the letter encoded in Gen 2 DVs.
+6. Loop until all constraints satisfied; no iteration cap (legal values always exist).
+
+**Shininess (SID calculation):**
+- Gen 2 shiny condition: `DV_ATK == 10 && DV_DEF == 10 && DV_SPD == 10 && DV_SPC == 10`. If shiny: choose TID (from Gen 2 save), generate PID, compute `SID = TID ^ (PID & 0xFFFF) ^ (PID >> 16)` such that `(TID ^ SID ^ (PID & 0xFFFF) ^ (PID >> 16)) < 8` (shiny XOR threshold). Assign that SID to the Gen 3 trainer profile.
+- Non-shiny: assign `SID = 51691` (arbitrary value that will not accidentally create shininess with any common TID/PID combination) or `SID = 0`.
+
+**EV conversion (proportional):**
+- Gen 2 uses 0–65535 StatExp per stat. Compute `total = sum(all 6 StatExp values)`.
+- If `total == 0`: all Gen 3 EVs = 0.
+- If `total > 0`: `EV[i] = min(255, floor(StatExp[i] / total × 510))`. All-maxed Gen 2 (total = 393210) → 85 per stat (6 × 85 = 510).
+- Gen 3 EV sum cap = 510 enforced automatically by the proportional formula.
+
+**EXP:** Copied exactly from Gen 2 to Gen 3 (no conversion needed; both use the same EXP growth curves for the same species).
+
+**Nature:** Determined by the LCRNG loop (PID % 25); not read from Gen 2 (Gen 2 has no nature concept).
+
+**Held items:** Before migration, attempt to return the held item to the Gen 2 trainer bag. If bag is full, place in PC item storage. If both full, block the migration and inform the player — the item must be manually freed first. The item is never silently discarded.
+
+**Korean nicknames:** If a Pokémon has a Korean-encoded nickname that cannot be represented in the target Gen 3 language encoding (e.g. English cartridge), prompt the player to enter a new nickname before proceeding. Default to the species name in the target language if the player skips.
+
+### Box UI Mockup (Web Artifact)
+
+A browser-based interactive mockup of the Box screen exists at:
+**`https://claude.ai/code/artifact/3e619d84-1fbe-4811-ac71-34928dbfa1c0`**
+
+Implements: 640px Wii-width canvas, 32px safe area, controls bar with L/R pair cycling, two 6×5 PBW box grids with full battle sprites, animated icon canvas row for cart Pokémon, right-click context menu (Move + Summary), summary panel, inline box rename, Save & Exit with unsaved-changes modal, dirty-state tracking. Source file: `pbw_box_ui.html` in the session scratchpad. Embedded sprite data (`sprites.js`) includes 10 full sprites + 10 icon sprites for: Bulbasaur, Pikachu, Charizard, Gengar, Eevee, Snorlax, Gyarados, Mewtwo, Arcanine, Alakazam.
+
+### PBW — What Is Not Yet Decided
+
+- Exact SD file layout for Gen 1/2 box storage (Gen 2 format; 20-slot boxes)
+- Adventure mode integration with mGBA (how to wire PBW box access into the emulation session)
+- Link cable trading from Adventure mode (deferred — see Phase 4 item 5 in wii-gb-operator)
+- Box background art, cursor sprite, home screen background (all placeholder — user will supply art; generate named template BMPs when requested)
+- Gen 2 icon sprite download and integration (Crystal Legacy repo, see above)
+- Wii GX rendering pipeline for the Box screen (to be ported from wii-gb-operator's GX setup)

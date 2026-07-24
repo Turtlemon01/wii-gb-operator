@@ -67,7 +67,7 @@ static int gbop_bulk_send(GBOpDevice *dev, const uint8_t *payload) {
     gbop_make_pkt(payload);
     DCFlushRange(s_tx, GBOP_PKT_SIZE);
     s32 r = USB_WriteBlkMsg(dev->fd, dev->ep_out, GBOP_PKT_SIZE, s_tx);
-    if (r < 0) lprintf("[gbop] cmd=0x%02X tx=%d\n", payload[0], (int)r);
+    lprintf("[gbop] cmd=0x%02X tx=%d\n", payload[0], (int)r);
     return (r < 0) ? (int)r : 0;
 }
 
@@ -132,6 +132,9 @@ static GBOpDevice *gbop_open_hw(void) {
 
     int first_match = -1;
     for (int i = 0; i < num_devs; i++) {
+        lprintf("[gbop]  dev[%d]: vid=%04X pid=%04X id=%d\n", i,
+                (unsigned)devlist[i].vid, (unsigned)devlist[i].pid,
+                (int)devlist[i].device_id);
         if (devlist[i].vid == GBOP_VID && devlist[i].pid == GBOP_PID && first_match < 0)
             first_match = i;
     }
@@ -151,13 +154,16 @@ static GBOpDevice *gbop_open_hw(void) {
     }
 
     ret = USB_OpenDevice(devlist[data_idx].device_id, GBOP_VID, GBOP_PID, &dev->fd);
+    lprintf("[gbop] OpenDevice(iface[%d]) ret=%d fd=%d\n",
+            data_idx - first_match, (int)ret, (int)dev->fd);
     if (ret < 0) {
-        lprintf("[gbop] OpenDevice(iface[%d]) failed: %d\n", data_idx - first_match, (int)ret);
+        lprintf("[gbop] OpenDevice failed (ret=%d)\n", (int)ret);
         free(dev);
         return NULL;
     }
-    lprintf("[gbop] Bulk fd=%d (iface[%d]) ep_out=%02X ep_in=%02X\n",
-            (int)dev->fd, data_idx - first_match, dev->ep_out, dev->ep_in);
+    if (dev->fd < 0)
+        lprintf("[gbop] fd negative (%d) — d2x-cIOS handle, proceeding\n", (int)dev->fd);
+    lprintf("[gbop] Bulk ep_out=%02X ep_in=%02X\n", dev->ep_out, dev->ep_in);
 
     s32 cfg = USB_WriteCtrlMsg(dev->fd, 0x00, 0x09, 0x0001, 0x0000, 0, NULL);
     if (cfg < 0) lprintf("[gbop] SET_CONFIGURATION ret=%d\n", (int)cfg);
@@ -167,9 +173,10 @@ static GBOpDevice *gbop_open_hw(void) {
 }
 
 GBOperatorHandle gbop_find(void) {
-    USB_Initialize();
-    usleep(500000);
-
+    /* USB host reset is NOT done here. For SD-boot: the host is already in a
+     * clean state (HBC didn't use USB). For USB-boot: main() resets it before
+     * mounting USB mass storage (Phase 2), and repeating the reset here would
+     * close the shared OH0 handle the storage driver depends on. */
     {
         static const uint8_t test[] = "123456789";
         uint32_t chk = crc32_mpeg2(test, 9);
@@ -227,13 +234,14 @@ GBOperatorHandle gbop_reopen(void) {
         data_idx = first_match;
 
     ret = USB_OpenDevice(devlist[data_idx].device_id, GBOP_VID, GBOP_PID, &dev->fd);
+    lprintf("[gbop] reopen: OpenDevice(iface[%d]) ret=%d fd=%d\n",
+            data_idx - first_match, (int)ret, (int)dev->fd);
     if (ret < 0) {
-        lprintf("[gbop] reopen: OpenDevice failed: %d\n", (int)ret);
+        lprintf("[gbop] reopen: OpenDevice failed (ret=%d)\n", (int)ret);
         free(dev);
         return NULL;
     }
-    lprintf("[gbop] reopen: fd=%d ep_out=%02X ep_in=%02X\n",
-            (int)dev->fd, dev->ep_out, dev->ep_in);
+    lprintf("[gbop] reopen: ep_out=%02X ep_in=%02X\n", dev->ep_out, dev->ep_in);
     return (GBOperatorHandle)dev;
 }
 

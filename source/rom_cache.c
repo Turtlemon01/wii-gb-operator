@@ -28,12 +28,19 @@ static void build_path(const CartInfo *info, const char *base_dir,
     snprintf(out, size, "%s/%s_%s.%s", base_dir, safe_title, info->game_code, ext);
 }
 
-// Prefer SD; fall back to USB if SD file doesn't exist.
+// Try g_app_root/roms first; fall back to the other drive in case ROMs were
+// cached in a previous session on a different storage device.
 static void resolve_path(const CartInfo *info, char *out, int size) {
-    build_path(info, ROM_CACHE_DIR_SD, out, size);
+    char roms_dir[64];
+    snprintf(roms_dir, sizeof(roms_dir), "%s/roms", g_app_root);
+    build_path(info, roms_dir, out, size);
     FILE *f = fopen(out, "rb");
     if (f) { fclose(f); return; }
-    build_path(info, ROM_CACHE_DIR_USB, out, size);
+    // Cross-drive fallback
+    const char *alt = (g_app_root[0] == 'u')
+                    ? "sd:/apps/wii-gb-operator/roms"
+                    : "usb:/apps/wii-gb-operator/roms";
+    build_path(info, alt, out, size);
 }
 
 int rom_cache_exists(const CartInfo *info, char *path_out, int path_size) {
@@ -52,19 +59,15 @@ int rom_cache_exists(const CartInfo *info, char *path_out, int path_size) {
 
 int rom_cache_dump(GBOperatorHandle handle, const CartInfo *info,
                    char *path_out, int path_size) {
-    // Try SD first, fall back to USB
-    build_path(info, ROM_CACHE_DIR_SD, path_out, path_size);
-    mkdir(ROM_CACHE_DIR_SD, 0755);
+    char roms_dir[64];
+    snprintf(roms_dir, sizeof(roms_dir), "%s/roms", g_app_root);
+    mkdir(roms_dir, 0755);
+    build_path(info, roms_dir, path_out, path_size);
 
     FILE *f = fopen(path_out, "wb");
     if (!f) {
-        mkdir(ROM_CACHE_DIR_USB, 0755);
-        build_path(info, ROM_CACHE_DIR_USB, path_out, path_size);
-        f = fopen(path_out, "wb");
-        if (!f) {
-            printf("[cache] ERROR: cannot open %s for writing\n", path_out);
-            return -1;
-        }
+        printf("[cache] ERROR: cannot open %s for writing\n", path_out);
+        return -1;
     }
 
     uint32_t total    = info->rom_size_kb * 1024;

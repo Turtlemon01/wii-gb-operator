@@ -11,3 +11,13 @@ build/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Claude Code local config
+.claude/
+
+# Test logs
+logs/
+
+# Unmanaged large directories
+vendor/
+sprites/

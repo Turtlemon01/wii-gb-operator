@@ -76,7 +76,11 @@
 /* Frames to show a green "saved" indicator after cart sync success */
 #define SAVE_INDICATOR_FRAMES 180
 
-#define AUDIO_LOG_PATH "sd:/apps/wii-gb-operator/audio_debug.txt"
+/* Save sync icon sprite dimensions (matches sprite files drawn by user) */
+#define ICON_W      16
+#define ICON_H      16
+#define ICON_PIXELS (ICON_W * ICON_H)
+
 
 /* -----------------------------------------------------------------------
  * Globals — video
@@ -168,6 +172,15 @@ static int            s_save_grace_frames = 0;
 /* Save indicator: local timer so the green dot shows for the full window
  * even if cart_sync immediately starts another write. */
 static int            s_save_ok_timer = 0;
+
+/* Save sync animation icon sprites (GBA only).
+ * Loaded from sd:/apps/wii-gb-operator/icons/ each session.
+ * Index 0 = sync_0 (in-progress frame 0), 1 = sync_1 (frame 1), 2 = sync_done. */
+static uint16_t  s_icon_rgb  [3][ICON_PIXELS]; /* RGB565 per pixel             */
+static uint8_t   s_icon_alpha[3][ICON_PIXELS]; /* 0 = transparent, skip pixel  */
+static bool      s_icons_loaded = false;
+static int       s_anim_frame   = 0;           /* 0 or 1, toggled every 30 fr  */
+static int       s_anim_timer   = 0;           /* frame counter for toggle     */
 
 /* Snapshot of save data at last confirmed player save (or at load time).
  * Used to distinguish real saves from background SRAM writes (RTC ticks,
@@ -505,6 +518,59 @@ static uint16_t *load_border_bmp(const char *path, int exp_w, int exp_h) {
     return out;
 }
 
+/* Load a 16×16 32bpp BGRA BMP (Aseprite export: BI_BITFIELDS or BI_RGB).
+ * Accepts any pixel-data offset; handles bottom-up row storage.
+ * Fills rgb_out (RGB565) and alpha_out (0 = transparent) arrays. */
+static bool load_icon_bmp(const char *path,
+                           uint16_t rgb_out[ICON_PIXELS],
+                           uint8_t  alpha_out[ICON_PIXELS]) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    uint8_t hdr[54];
+    if (fread(hdr, 1, 54, f) != 54 || hdr[0] != 'B' || hdr[1] != 'M') {
+        fclose(f); return false;
+    }
+
+    uint32_t data_off = (uint32_t)hdr[10] | ((uint32_t)hdr[11]<<8) |
+                        ((uint32_t)hdr[12]<<16) | ((uint32_t)hdr[13]<<24);
+    int32_t  bmp_w    = (int32_t)((uint32_t)hdr[18] | ((uint32_t)hdr[19]<<8) |
+                                  ((uint32_t)hdr[20]<<16) | ((uint32_t)hdr[21]<<24));
+    int32_t  bmp_h    = (int32_t)((uint32_t)hdr[22] | ((uint32_t)hdr[23]<<8) |
+                                  ((uint32_t)hdr[24]<<16) | ((uint32_t)hdr[25]<<24));
+    uint16_t bpp      = (uint16_t)(hdr[28] | ((uint16_t)hdr[29]<<8));
+    uint32_t comp     = (uint32_t)hdr[30] | ((uint32_t)hdr[31]<<8) |
+                        ((uint32_t)hdr[32]<<16) | ((uint32_t)hdr[33]<<24);
+
+    bool    flip  = (bmp_h > 0);
+    int32_t abs_h = bmp_h < 0 ? -bmp_h : bmp_h;
+    bool    ok32  = (bpp == 32 && (comp == 0 || comp == 3 || comp == 6));
+    if (bmp_w != ICON_W || abs_h != ICON_H || !ok32) {
+        lprintf("[icon] %s: need %dx%d 32bpp; got %dx%d bpp=%u comp=%u\n",
+                path, ICON_W, ICON_H, bmp_w, abs_h, bpp, comp);
+        fclose(f); return false;
+    }
+
+    uint8_t row_buf[ICON_W * 4];
+    fseek(f, (long)data_off, SEEK_SET);
+    for (int y = 0; y < ICON_H; y++) {
+        if ((int)fread(row_buf, 1, sizeof(row_buf), f) < (int)sizeof(row_buf)) break;
+        int dst_y = flip ? (ICON_H - 1 - y) : y;
+        for (int x = 0; x < ICON_W; x++) {
+            uint8_t b = row_buf[x * 4 + 0]; /* Aseprite BGRA byte order */
+            uint8_t g = row_buf[x * 4 + 1];
+            uint8_t r = row_buf[x * 4 + 2];
+            uint8_t a = row_buf[x * 4 + 3];
+            int idx = dst_y * ICON_W + x;
+            rgb_out  [idx] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            alpha_out[idx] = a;
+        }
+    }
+
+    fclose(f);
+    return true;
+}
+
 /* Tile-swizzle frame into GX texture.
  * When s_border_active: composites the 160×144 CGB game (in s_vbuf at
  * stride s_game_w) into the center of the 256×224 border frame.
@@ -576,48 +642,75 @@ static void gx_draw_frame(unsigned w, unsigned h) {
     GX_End();
 }
 
-/* Draw 8×8 coloured dot in top-right corner of s_vbuf (before tiling).
- * Maintains an independent local timer so SUCCESS is visible for the full
- * SAVE_INDICATOR_FRAMES window even if cart_sync immediately starts a new write. */
+/* Blit one 16×16 save-sync icon sprite into s_vbuf at pixel offset (ox, oy).
+ * Pixels with alpha == 0 are skipped so game content shows through. */
+static void blit_icon(int icon_idx, int ox, int oy) {
+    const uint16_t *rgb   = s_icon_rgb  [icon_idx];
+    const uint8_t  *alpha = s_icon_alpha[icon_idx];
+    int fw = (int)s_game_w, fh = (int)s_game_h;
+    for (int y = 0; y < ICON_H; y++) {
+        int py = oy + y;
+        if (py < 0 || py >= fh) continue;
+        for (int x = 0; x < ICON_W; x++) {
+            if (!alpha[y * ICON_W + x]) continue;
+            int px = ox + x;
+            if (px < 0 || px >= fw) continue;
+            s_vbuf[py * fw + px] = rgb[y * ICON_W + x];
+        }
+    }
+}
+
+/* Draw animated save-sync icon in top-right corner of the game area (GBA only).
+ * In-progress: alternates sync_0/sync_1 every 30 frames.
+ * Success: shows sync_done for SAVE_INDICATOR_FRAMES frames.
+ * Falls back to a coloured 8×8 dot when icon files are not present on SD. */
 static void draw_save_indicator(void) {
-    /* Only show the indicator for GBA (auto-sync). GB/GBC use manual OSD sync. */
     if (!s_info || s_info->type != CART_TYPE_GBA) { cart_sync_state(); return; }
     CartSyncState st = cart_sync_state();
-    uint16_t color = 0;
 
-    if (st == CART_SYNC_SUCCESS) {
-        /* Latch green timer; don't let a racing IN_PROGRESS clobber it */
+    if (st == CART_SYNC_SUCCESS)
         s_save_ok_timer = SAVE_INDICATOR_FRAMES;
-    }
 
+    int icon_idx = -1;
     if (s_save_ok_timer > 0) {
-        /* Green takes priority: show success even if another write started */
-        color = 0x07E0; /* green */
+        icon_idx = 2; /* sync_done */
         s_save_ok_timer--;
     } else if (st == CART_SYNC_IN_PROGRESS) {
-        color = 0xFFE0; /* yellow */
+        s_anim_timer++;
+        if (s_anim_timer >= 30) { s_anim_timer = 0; s_anim_frame ^= 1; }
+        icon_idx = s_anim_frame; /* 0 or 1 */
     } else if (st == CART_SYNC_FAILED) {
-        color = 0xF800; /* red */
+        icon_idx = 0; /* static frame 0 for failed — no animation */
     } else {
-        return; /* IDLE, no dot */
+        s_anim_timer = 0;
+        s_anim_frame = 0;
+        return; /* IDLE */
     }
 
-    /* In pure SGB mode, mGBA renders the 160×144 game area at offset
-     * (BORDER_GAME_X, BORDER_GAME_Y) inside the 256×224 frame.  Drawing at
-     * (s_game_w - 8, 0) would land in the SGB border region, which mGBA
-     * redraws every frame — the dot would be invisible.  Place it in the
-     * top-right corner of the actual game area instead. */
-    int dot_x, dot_y;
+    /* In pure SGB mode the game area is inset inside the 256×224 frame.
+     * Drawing at (s_game_w - ICON_W, 0) would land in the SGB border region
+     * which mGBA redraws every frame — the icon would be invisible. */
+    int ox, oy;
     if (!s_border_active && s_game_w == (unsigned)SGB_W) {
-        dot_x = BORDER_GAME_X + (int)GB_W - 8;
-        dot_y = BORDER_GAME_Y;
+        ox = BORDER_GAME_X + (int)GB_W - ICON_W;
+        oy = BORDER_GAME_Y;
     } else {
-        dot_x = (int)s_game_w - 8;
-        dot_y = 0;
+        ox = (int)s_game_w - ICON_W;
+        oy = 0;
     }
-    for (int y = dot_y; y < dot_y + 8; y++)
-        for (int x = dot_x; x < dot_x + 8; x++)
-            s_vbuf[y * (int)s_game_w + x] = (color_t)color;
+
+    if (s_icons_loaded) {
+        blit_icon(icon_idx, ox, oy);
+    } else {
+        /* Fallback: coloured 8×8 dot when icon BMPs are not on SD */
+        uint16_t color = (icon_idx == 2)              ? 0x07E0 : /* green  */
+                         (st == CART_SYNC_FAILED)      ? 0xF800 : /* red    */
+                                                         0xFFE0;  /* yellow */
+        int fw = (int)s_game_w, fh = (int)s_game_h;
+        for (int y = oy; y < oy + 8 && y < fh; y++)
+            for (int x = ox; x < ox + 8 && x < fw; x++)
+                s_vbuf[y * fw + x] = (color_t)color;
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -871,12 +964,14 @@ int mgba_run(const CartInfo *info, const char *rom_path, const char *save_path,
     if (save_path) lprintf("[mgba] Save: %s (%u KB)\n", save_path, save_kb);
     log_force_flush();
 
-    /* Audio debug log — separate file, force-committed to SD every 60 frames */
-    s_audio_log = fopen(AUDIO_LOG_PATH, "w");
+    /* Audio debug log — separate file, force-committed to drive every 60 frames */
+    char audio_log_path[64];
+    snprintf(audio_log_path, sizeof(audio_log_path), "%s/audio_debug.txt", g_app_root);
+    s_audio_log = fopen(audio_log_path, "w");
     if (s_audio_log) {
         fprintf(s_audio_log, "frame,blip_avail,next_buf_fill,dma_running\n");
         fclose(s_audio_log);
-        s_audio_log = fopen(AUDIO_LOG_PATH, "a");
+        s_audio_log = fopen(audio_log_path, "a");
     }
     lprintf("[mgba] Audio log: %s\n", s_audio_log ? "open" : "FAILED"); log_force_flush();
 
@@ -1076,7 +1171,7 @@ int mgba_run(const CartInfo *info, const char *rom_path, const char *save_path,
         char border_path[256];
         if (code_valid && game_code[0]) {
             snprintf(border_path, sizeof(border_path),
-                     "sd:/apps/wii-gb-operator/borders/gbc/border_%s.bmp", game_code);
+                     "%s/borders/gbc/border_%s.bmp", g_app_root, game_code);
         } else {
             /* Fallback: sanitised 11-byte ROM title */
             char rom_title[12] = {0};
@@ -1096,7 +1191,7 @@ int mgba_run(const CartInfo *info, const char *rom_path, const char *save_path,
                     safe[j++] = '_';
             }
             snprintf(border_path, sizeof(border_path),
-                     "sd:/apps/wii-gb-operator/borders/gbc/%s.bmp", safe);
+                     "%s/borders/gbc/%s.bmp", g_app_root, safe);
         }
         lprintf("[border] GBC: Looking for: %s (code=\"%s\")\n", border_path, game_code);
         s_border_buf = load_border_bmp(border_path, SGB_W, SGB_H);
@@ -1127,7 +1222,7 @@ int mgba_run(const CartInfo *info, const char *rom_path, const char *save_path,
         if (code_valid && gba_code[0]) {
             char gba_border_path[256];
             snprintf(gba_border_path, sizeof(gba_border_path),
-                     "sd:/apps/wii-gb-operator/borders/gba/border_%s.bmp", gba_code);
+                     "%s/borders/gba/border_%s.bmp", g_app_root, gba_code);
             lprintf("[border] GBA: Looking for: %s\n", gba_border_path);
             s_gba_border_buf = load_border_bmp(gba_border_path, GBA_BORDER_W, GBA_BORDER_H);
             if (s_gba_border_buf) {
@@ -1136,6 +1231,24 @@ int mgba_run(const CartInfo *info, const char *rom_path, const char *save_path,
                         GBA_BORDER_W, GBA_BORDER_H);
             }
         }
+    }
+
+    /* Save sync animation icons — GBA only; GB/C uses manual OSD, no icon needed. */
+    s_icons_loaded = false;
+    s_anim_frame   = 0;
+    s_anim_timer   = 0;
+    if (s_core->platform(s_core) == mPLATFORM_GBA) {
+        char icon_path[64];
+        snprintf(icon_path, sizeof(icon_path), "%s/icons/sync_0.bmp", g_app_root);
+        bool ok0 = load_icon_bmp(icon_path, s_icon_rgb[0], s_icon_alpha[0]);
+        snprintf(icon_path, sizeof(icon_path), "%s/icons/sync_1.bmp", g_app_root);
+        bool ok1 = load_icon_bmp(icon_path, s_icon_rgb[1], s_icon_alpha[1]);
+        snprintf(icon_path, sizeof(icon_path), "%s/icons/sync_done.bmp", g_app_root);
+        bool ok2 = load_icon_bmp(icon_path, s_icon_rgb[2], s_icon_alpha[2]);
+        s_icons_loaded = ok0 && ok1 && ok2;
+        lprintf("[icon] %s (sync_0=%s sync_1=%s done=%s)\n",
+                s_icons_loaded ? "Loaded" : "Not found — dot fallback",
+                ok0?"ok":"FAIL", ok1?"ok":"FAIL", ok2?"ok":"FAIL");
     }
 
     /* If no file snapshot was taken (no save file on SD), take one now from the

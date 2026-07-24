@@ -4,8 +4,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define INDEX_PATH "sd:/apps/wii-gb-operator/cartindex.ini"
-
 /* Fingerprint: resp[2..59] = 58 bytes = 116 hex chars.
  * resp[0..1] are protocol header bytes (excluded).
  * All remaining bytes are included so that any game-specific field in
@@ -26,10 +24,12 @@ static void make_fp(const CartInfo *info, char fp[FP_HEX + 1]) {
 int cartindex_lookup(const CartInfo *info, CartIndexEntry *out, int max) {
     if (!info || !out || max <= 0) return 0;
 
+    char index_path[64];
+    snprintf(index_path, sizeof(index_path), "%s/cartindex.ini", g_app_root);
     char fp[FP_HEX + 1];
     make_fp(info, fp);
 
-    FILE *f = fopen(INDEX_PATH, "r");
+    FILE *f = fopen(index_path, "r");
     if (!f) return 0;
 
     int n = 0;
@@ -56,11 +56,13 @@ int cartindex_lookup(const CartInfo *info, CartIndexEntry *out, int max) {
 void cartindex_update(const CartInfo *info, const char *rom_basename) {
     if (!info || !rom_basename || !rom_basename[0]) return;
 
+    char index_path[64];
+    snprintf(index_path, sizeof(index_path), "%s/cartindex.ini", g_app_root);
     char fp[FP_HEX + 1];
     make_fp(info, fp);
 
     /* Check for exact duplicate before appending */
-    FILE *f = fopen(INDEX_PATH, "r");
+    FILE *f = fopen(index_path, "r");
     if (f) {
         char line[256];
         while (fgets(line, sizeof(line), f)) {
@@ -79,9 +81,9 @@ void cartindex_update(const CartInfo *info, const char *rom_basename) {
     }
 
     /* Append; create file with header comment if it doesn't exist yet */
-    FILE *fa = fopen(INDEX_PATH, "a");
+    FILE *fa = fopen(index_path, "a");
     if (!fa) {
-        fa = fopen(INDEX_PATH, "w");
+        fa = fopen(index_path, "w");
         if (fa) fprintf(fa, "# wii-gb-operator cart index — built automatically\n"
                             "# fingerprint|rom_basename\n");
     }

@@ -10,6 +10,8 @@
 #include <ogc/pad.h>
 #include <fat.h>
 #include <sdcard/wiisd_io.h>
+#include <ogc/usbstorage.h>
+#include <ogc/usb.h>
 #include "log.h"
 #include "gb_operator.h"
 #include "rom_cache.h"
@@ -25,6 +27,9 @@ FILE *g_log = NULL;
 char  g_log_path[64] = {0};
 int   g_log_suppress_console = 0; /* set to 1 during GX emulation */
 
+/* Detected at startup — whichever drive (sd: or usb:) has the app folder. */
+char g_app_root[32] = "sd:/apps/wii-gb-operator";
+
 /* Set by the physical Wii Reset button; checked in all blocking loops. */
 volatile int g_reset_pressed = 0;
 static void main_on_reset(u32 irq, void *ctx) { (void)irq; (void)ctx; g_reset_pressed = 1; }
@@ -39,10 +44,34 @@ static void main_on_power(void) {
 
 #define DEV_MENU_ITEMS 8
 
-#define SAVES_DIR    "sd:/apps/wii-gb-operator/saves"
-#define BACKUPS_DIR  "sd:/apps/wii-gb-operator/saves/backups"
-#define ROMS_DIR     ROM_CACHE_DIR_SD
 #define STICK_THRESH 40
+
+/* Phase 1 drive detection — SD probe only, no USB mount.
+ * USB mass storage (fatMountSimple "usb") must NOT be called here because the
+ * USB mass storage driver shares the OH0 USB host controller with the GB Operator.
+ * Starting it before gbop_find() prevents GB Operator enumeration.
+ * Returns true if SD has the app dir; false means Phase 2 in main() will try USB. */
+static bool detect_app_drive(void) {
+    DIR *d = opendir("sd:/apps/wii-gb-operator");
+    if (d) {
+        closedir(d);
+        snprintf(g_app_root, sizeof(g_app_root), "sd:/apps/wii-gb-operator");
+        printf("[OK]  App drive: SD card\n");
+        return true;
+    }
+    /* usb: is not mounted yet; this succeeds only if some earlier layer (HBC in
+     * rare configs) already made it accessible. USB mount is deferred to Phase 2. */
+    d = opendir("usb:/apps/wii-gb-operator");
+    if (d) {
+        closedir(d);
+        snprintf(g_app_root, sizeof(g_app_root), "usb:/apps/wii-gb-operator");
+        printf("[OK]  App drive: USB storage (pre-mounted)\n");
+        return false;
+    }
+    snprintf(g_app_root, sizeof(g_app_root), "sd:/apps/wii-gb-operator");
+    printf("[INFO] App dir not on SD — USB will be checked after GB Operator init\n");
+    return false;
+}
 
 // Extracts the full title from a ROM header buffer.
 // GB/GBC: title at 0x0134, length 11 for CGB carts (CGB flag 0x80/0xC0 at 0x0143)
@@ -164,7 +193,7 @@ static void enrich_info_from_buf(CartInfo *info, const uint8_t *hdr) {
             info->type_str, info->title, info->game_code);
 }
 
-// Mirrors rom_cache.c's static build_path for SD (duplicated since it's static there).
+// Mirrors rom_cache.c's static build_path (duplicated since it's static there).
 // Used when we need the canonical ROM path after enriching info.title/game_code.
 static void build_rom_path_sd(const CartInfo *info, char *out, size_t size) {
     char safe[32] = {0};
@@ -178,7 +207,9 @@ static void build_rom_path_sd(const CartInfo *info, char *out, size_t size) {
     }
     const char *ext = (info->type == CART_TYPE_GBA) ? "gba"
                     : (info->type == CART_TYPE_GBC) ? "gbc" : "gb";
-    snprintf(out, size, "%s/%s_%s.%s", ROM_CACHE_DIR_SD, safe, info->game_code, ext);
+    char roms_dir[64];
+    snprintf(roms_dir, sizeof(roms_dir), "%s/roms", g_app_root);
+    snprintf(out, size, "%s/%s_%s.%s", roms_dir, safe, info->game_code, ext);
 }
 
 // Enriches info with full title/code from a cached ROM file at the standard path.
@@ -254,10 +285,15 @@ static int try_enrich_from_index(CartInfo *info) {
     int valid_n = 0;
     for (int i = 0; i < n && valid_n < 8; i++) {
         char path[256];
-        snprintf(path, sizeof(path), "%s/%s", ROM_CACHE_DIR_SD, entries[i].rom_basename);
+        char roms_dir[64];
+        snprintf(roms_dir, sizeof(roms_dir), "%s/roms", g_app_root);
+        snprintf(path, sizeof(path), "%s/%s", roms_dir, entries[i].rom_basename);
         FILE *f = fopen(path, "rb");
         if (!f) {
-            snprintf(path, sizeof(path), "%s/%s", ROM_CACHE_DIR_USB, entries[i].rom_basename);
+            const char *alt = (g_app_root[0] == 'u')
+                            ? "sd:/apps/wii-gb-operator/roms"
+                            : "usb:/apps/wii-gb-operator/roms";
+            snprintf(path, sizeof(path), "%s/%s", alt, entries[i].rom_basename);
             f = fopen(path, "rb");
         }
         if (!f) { lprintf("[index] Entry missing: %s\n", entries[i].rom_basename); continue; }
@@ -302,10 +338,9 @@ static void build_save_path(const CartInfo *info, char *path, size_t path_size) 
             safe[j++] = '_';
     }
     if (info->game_code[0])
-        snprintf(path, path_size, "sd:/apps/wii-gb-operator/saves/%s_%s.sav",
-                 safe, info->game_code);
+        snprintf(path, path_size, "%s/saves/%s_%s.sav", g_app_root, safe, info->game_code);
     else
-        snprintf(path, path_size, "sd:/apps/wii-gb-operator/saves/%s.sav", safe);
+        snprintf(path, path_size, "%s/saves/%s.sav", g_app_root, safe);
 }
 
 /* -----------------------------------------------------------------------
@@ -391,14 +426,17 @@ static void launch_mgba(const CartInfo *info) {
     static const char *rom_items[BROWSER_MAX];
 
     /* Collect ROMs — scan for .gb, .gbc, .gba */
+    char roms_dir[64], saves_dir[64];
+    snprintf(roms_dir,  sizeof(roms_dir),  "%s/roms",  g_app_root);
+    snprintf(saves_dir, sizeof(saves_dir), "%s/saves", g_app_root);
     int rom_cnt = 0;
     {
         static char rn_gb[BROWSER_MAX][64], rp_gb[BROWSER_MAX][256];
         static char rn_gbc[BROWSER_MAX][64], rp_gbc[BROWSER_MAX][256];
         static char rn_gba[BROWSER_MAX][64], rp_gba[BROWSER_MAX][256];
-        int n_gb  = scan_dir(ROMS_DIR, ".gb",  rn_gb,  rp_gb);
-        int n_gbc = scan_dir(ROMS_DIR, ".gbc", rn_gbc, rp_gbc);
-        int n_gba = scan_dir(ROMS_DIR, ".gba", rn_gba, rp_gba);
+        int n_gb  = scan_dir(roms_dir, ".gb",  rn_gb,  rp_gb);
+        int n_gbc = scan_dir(roms_dir, ".gbc", rn_gbc, rp_gbc);
+        int n_gba = scan_dir(roms_dir, ".gba", rn_gba, rp_gba);
         for (int i = 0; i < n_gb  && rom_cnt < BROWSER_MAX; i++, rom_cnt++) {
             strncpy(rom_names[rom_cnt], rn_gb[i],  63);
             strncpy(rom_paths[rom_cnt], rp_gb[i], 255);
@@ -413,7 +451,7 @@ static void launch_mgba(const CartInfo *info) {
         }
     }
     for (int i = 0; i < rom_cnt; i++) rom_items[i] = rom_names[i];
-    lprintf("[mgba] Found %d ROMs in %s\n", rom_cnt, ROMS_DIR);
+    lprintf("[mgba] Found %d ROMs in %s\n", rom_cnt, roms_dir);
 
     int rom_sel = run_browser("Select ROM", (const char **)rom_items, rom_cnt);
     if (rom_sel < 0) { lprintf("[mgba] ROM selection cancelled\n"); return; }
@@ -431,14 +469,14 @@ static void launch_mgba(const CartInfo *info) {
     sav_cnt = 1;
     {
         static char sn[BROWSER_MAX][64], sp[BROWSER_MAX][256];
-        int n = scan_dir(SAVES_DIR, ".sav", sn, sp);
+        int n = scan_dir(saves_dir, ".sav", sn, sp);
         for (int i = 0; i < n && sav_cnt <= BROWSER_MAX; i++, sav_cnt++) {
             strncpy(sav_names[sav_cnt], sn[i], 63);
             strncpy(sav_paths[sav_cnt], sp[i], 255);
         }
     }
     for (int i = 0; i < sav_cnt; i++) sav_items[i] = sav_names[i];
-    lprintf("[mgba] Found %d saves in %s\n", sav_cnt - 1, SAVES_DIR);
+    lprintf("[mgba] Found %d saves in %s\n", sav_cnt - 1, saves_dir);
 
     int sav_sel = run_browser("Select Save", (const char **)sav_items, sav_cnt);
     if (sav_sel < 0) { lprintf("[mgba] Save selection cancelled\n"); return; }
@@ -775,7 +813,9 @@ static int prompt_yesno(const char *msg) {
  * ---------------------------------------------------------------------- */
 
 static void backup_save(const CartInfo *info, const char *save_path) {
-    mkdir(BACKUPS_DIR, 0755);
+    char backups_dir[64];
+    snprintf(backups_dir, sizeof(backups_dir), "%s/saves/backups", g_app_root);
+    mkdir(backups_dir, 0755);
 
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -793,7 +833,7 @@ static void backup_save(const CartInfo *info, const char *save_path) {
 
     char dst_path[256];
     snprintf(dst_path, sizeof(dst_path),
-             "%s/%s_%04d%02d%02d_%02d%02d%02d.sav", BACKUPS_DIR, safe,
+             "%s/%s_%04d%02d%02d_%02d%02d%02d.sav", backups_dir, safe,
              t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
              t->tm_hour, t->tm_min, t->tm_sec);
 
@@ -827,12 +867,12 @@ static int browse_save_file(char *path_out, size_t path_size) {
     static int  item_isdir[BROWSE_FS_MAX];
 
     char cur_dir[256];
-    strncpy(cur_dir, SAVES_DIR, sizeof(cur_dir) - 1);
-    cur_dir[sizeof(cur_dir) - 1] = '\0';
-    /* Fall back to SD root if saves dir doesn't exist yet */
+    snprintf(cur_dir, sizeof(cur_dir), "%s/saves", g_app_root);
+    /* Fall back to drive root if saves dir doesn't exist yet */
     {
         DIR *td = opendir(cur_dir);
-        if (!td) strncpy(cur_dir, "sd:/", sizeof(cur_dir) - 1);
+        if (!td) snprintf(cur_dir, sizeof(cur_dir), "%s:/",
+                          (g_app_root[0] == 'u') ? "usb" : "sd");
         else closedir(td);
     }
 
@@ -843,7 +883,8 @@ static int browse_save_file(char *path_out, size_t path_size) {
         int cnt = 0;
 
         /* ".." entry if not at root */
-        bool at_root = (strcmp(cur_dir, "sd:/") == 0 || strcmp(cur_dir, "sd:") == 0);
+        bool at_root = (strcmp(cur_dir, "sd:/") == 0 || strcmp(cur_dir, "sd:") == 0 ||
+                        strcmp(cur_dir, "usb:/") == 0 || strcmp(cur_dir, "usb:") == 0);
         if (!at_root) {
             strncpy(item_names[cnt], "..", 63);
             item_names[cnt][63] = '\0';
@@ -1140,8 +1181,10 @@ static void play_game(CartInfo *info, uint8_t *rom_hdr,
         }
     }
 
-    /* Write save to SD */
-    mkdir(SAVES_DIR, 0755);
+    /* Write save to storage */
+    char saves_dir_pg[64];
+    snprintf(saves_dir_pg, sizeof(saves_dir_pg), "%s/saves", g_app_root);
+    mkdir(saves_dir_pg, 0755);
     char save_path[256] = {0};
     build_save_path(info, save_path, sizeof(save_path));
     FILE *sf = fopen(save_path, "wb");
@@ -1184,7 +1227,11 @@ static int dump_save_to_sd(GBOperatorHandle op, const CartInfo *info,
         return -1;
     }
 
-    mkdir("sd:/apps/wii-gb-operator/saves", 0755);
+    {
+        char saves_dir_ds[64];
+        snprintf(saves_dir_ds, sizeof(saves_dir_ds), "%s/saves", g_app_root);
+        mkdir(saves_dir_ds, 0755);
+    }
 
     char path[256];
     build_save_path(info, path, sizeof(path));
@@ -1454,35 +1501,64 @@ int main(int argc, char **argv) {
         if (retry > 0) { printf("SD retry %d...\n", retry); usleep(200000); }
         sd_ok = fatMountSimple("sd", &__io_wiisd);
     }
-    if (!sd_ok) {
-        printf("[WARN] SD mount failed — log and caching disabled\n");
-    } else {
-        printf("[OK]  SD mounted\n");
-        /* Log rotation: find next available log.txt / log1.txt / log2.txt ... */
+    if (sd_ok) printf("[OK]  SD mounted\n");
+    else       printf("[WARN] SD mount failed\n");
+
+    /* Phase 1: detect app drive (SD probe only — USB deferred to Phase 2). */
+    bool sd_has_app_dir = detect_app_drive();
+
+    /* Log rotation: find next available log.txt / log1.txt / log2.txt ... */
+    {
         char log_path[64];
-        {
-            FILE *t = fopen("sd:/apps/wii-gb-operator/log.txt", "r");
-            if (!t) {
-                strcpy(log_path, "sd:/apps/wii-gb-operator/log.txt");
-            } else {
-                fclose(t);
-                int n;
-                for (n = 1; n < 200; n++) {
-                    snprintf(log_path, sizeof(log_path),
-                             "sd:/apps/wii-gb-operator/log%d.txt", n);
-                    FILE *t2 = fopen(log_path, "r");
-                    if (!t2) break;
-                    fclose(t2);
-                }
+        snprintf(log_path, sizeof(log_path), "%s/log.txt", g_app_root);
+        FILE *t = fopen(log_path, "r");
+        if (t) {
+            fclose(t);
+            int n;
+            for (n = 1; n < 200; n++) {
+                snprintf(log_path, sizeof(log_path), "%s/log%d.txt", g_app_root, n);
+                FILE *t2 = fopen(log_path, "r");
+                if (!t2) break;
+                fclose(t2);
             }
         }
         strncpy(g_log_path, log_path, sizeof(g_log_path) - 1);
         g_log = fopen(g_log_path, "w");
         if (g_log) printf("[OK]  Logging to %s\n", g_log_path);
-        else printf("[WARN] Log file open failed\n");
+        else       printf("[WARN] Log file open failed\n");
     }
 
     settings_load();
+
+    /* Phase 2: USB mass storage — only when SD did not have the app dir.
+     * For USB-boot users, HBC leaves the USB host controller in a stale state
+     * (d2x-cIOS issue) that causes USB_OpenDevice to return garbage fds.
+     * We reset the USB host BEFORE mounting USB storage so the storage driver
+     * initialises on a clean bus. gbop_find() must NOT repeat this reset after
+     * storage is mounted — USB_Deinitialize would close the shared OH0 handle
+     * that the storage driver depends on, breaking log writes and ROM/save I/O. */
+    if (!sd_has_app_dir) {
+        USB_Deinitialize();
+        USB_Initialize();
+        usleep(2000000);  /* 2s for GB Operator to re-enumerate on the clean bus */
+    }
+    if (!sd_has_app_dir) {
+        if (fatMountSimple("usb", &__io_usbstorage)) {
+            printf("[OK]  USB storage mounted\n");
+            DIR *_ud = opendir("usb:/apps/wii-gb-operator");
+            if (_ud) {
+                closedir(_ud);
+                snprintf(g_app_root, sizeof(g_app_root), "usb:/apps/wii-gb-operator");
+                printf("[OK]  Switched app drive to USB storage\n");
+                if (g_log) { fclose(g_log); g_log = NULL; }
+                snprintf(g_log_path, sizeof(g_log_path), "%s/log.txt", g_app_root);
+                g_log = fopen(g_log_path, "w");
+                if (g_log) printf("[OK]  Logging switched to %s\n", g_log_path);
+                else       printf("[WARN] Could not open log on USB\n");
+                settings_load();
+            }
+        }
+    }
 
     lprintf("\n===== SESSION START =====\n\n");
     lprintf("Wii GB Operator Test\n");
