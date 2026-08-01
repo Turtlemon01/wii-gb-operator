@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -195,24 +196,53 @@ static void enrich_info_from_buf(CartInfo *info, const uint8_t *hdr) {
 
     // New-firmware cart-info doesn't carry a usable size field (see CLAUDE.md
     // "resp[26..29] is a fixed constant" finding), so rom_size_kb/ram_size_kb
-    // are left at 0 by the new cart-info parse. Fill them in here from the
-    // known-game table now that the header (and therefore game code) is
-    // available; falls back to a generous safe-max guess for unrecognized
-    // games so rom_cache.c's total-based loop doesn't stop before the
-    // device's real end-of-stream footer arrives (see rom_sizes.h and the
-    // "Do Not: Refactor rom_cache.c" entry for why oversizing is the safe
-    // direction to guess wrong in, not undersizing).
+    // are left at 0 by the new cart-info parse. Fill them in here now that
+    // the header is available.
     if (!g_settings.use_old_firmware) {
-        if (info->rom_size_kb == 0) {
-            uint32_t rom_kb = rom_sizes_lookup_rom_kb(info->type, hdr);
-            info->rom_size_kb = rom_kb ? rom_kb
-                               : (info->type == CART_TYPE_GBA ? 32768 : 8192);
-            info->rom_size_confirmed = rom_kb ? 1 : 0;
-        }
-        if (info->ram_size_kb == 0) {
-            uint32_t ram_kb = rom_sizes_lookup_ram_kb(info->type, hdr);
-            info->ram_size_kb = ram_kb ? ram_kb : 128;
-            info->ram_size_confirmed = ram_kb ? 1 : 0;
+        if (info->type == CART_TYPE_GBA) {
+            // GBA has no self-describing size field — table lookup, falling
+            // back to a generous safe-max guess for unrecognized games so
+            // rom_cache.c's total-based loop doesn't stop before the
+            // device's real end-of-stream footer arrives (see rom_sizes.h
+            // and the "Do Not: Refactor rom_cache.c" entry for why
+            // oversizing is the safe direction to guess wrong in, not
+            // undersizing). dump_rom_new_protocol() corrects an unconfirmed
+            // guess after capture via the cart's own hardware mirroring
+            // behavior (gbop_detect_gba_mirror_size()).
+            if (info->rom_size_kb == 0) {
+                uint32_t rom_kb = rom_sizes_lookup_rom_kb(info->type, hdr);
+                info->rom_size_kb = rom_kb ? rom_kb : 32768;
+                info->rom_size_confirmed = rom_kb ? 1 : 0;
+            }
+            if (info->ram_size_kb == 0) {
+                uint32_t ram_kb = rom_sizes_lookup_ram_kb(info->type, hdr);
+                info->ram_size_kb = ram_kb ? ram_kb : 128;
+                info->ram_size_confirmed = ram_kb ? 1 : 0;
+            }
+        } else {
+            // GB/GBC: the cartridge header directly, unambiguously encodes
+            // real ROM/RAM size at fixed offsets 0x148/0x149 — exact for
+            // any cart, not a curated-table guess (see gb_header_rom_kb()/
+            // gb_header_ram_kb() in rom_sizes.c for why this is trustworthy
+            // and why it replaced the old table approach). RAM specifically
+            // needs the UINT32_MAX sentinel to distinguish a confirmed,
+            // genuine "no save chip" (0 KB — e.g. Super Mario Land) from a
+            // byte value this function doesn't recognize at all.
+            if (info->rom_size_kb == 0) {
+                uint32_t rom_kb = gb_header_rom_kb(hdr);
+                info->rom_size_kb = rom_kb ? rom_kb : 8192;
+                info->rom_size_confirmed = rom_kb ? 1 : 0;
+            }
+            if (info->ram_size_kb == 0) {
+                uint32_t ram_kb = gb_header_ram_kb(hdr);
+                if (ram_kb == UINT32_MAX) {
+                    info->ram_size_kb = 128;
+                    info->ram_size_confirmed = 0;
+                } else {
+                    info->ram_size_kb = ram_kb;
+                    info->ram_size_confirmed = 1;
+                }
+            }
         }
     }
 
@@ -1812,7 +1842,10 @@ static int dump_rom_new_protocol(GBOperatorHandle *op, CartInfo *info,
                                   GbopByteProgressCB progress_cb, void *progress_ctx) {
     uint32_t total = info->rom_size_kb * 1024;
     uint8_t *buf = malloc(total);
-    if (!buf) return -1;
+    if (!buf) {
+        lprintf("[dump] new-protocol: malloc(%u) for ROM buffer failed\n", total);
+        return -1;
+    }
 
     int cycles_used = 0;
     int rc = -1;
@@ -1841,10 +1874,63 @@ static int dump_rom_new_protocol(GBOperatorHandle *op, CartInfo *info,
 
     if (rc != 0) { free(buf); return -1; }
 
+    // GBA, unconfirmed size (unrecognized game — rom_sizes.c had no table
+    // entry, so `total` above is the generic 32768KB fallback, not a real
+    // capacity): the device streams up to whatever was requested rather
+    // than stopping at the cart's true size on its own (confirmed via
+    // Mario Golf, Save Read Write Test/test_external_1), so `buf` may
+    // contain real ROM data followed by mirrored padding. Determine the
+    // real boundary from the cart's own hardware mirroring behavior and
+    // write only that many bytes — this is what makes an unrecognized game
+    // dump correctly-sized without needing a table entry for every game.
+    uint32_t write_size = total;
+    if (info->type == CART_TYPE_GBA && !info->rom_size_confirmed) {
+        uint32_t real_size;
+        if (gbop_detect_gba_mirror_size(buf, total, &real_size)) {
+            lprintf("[dump] GBA mirror-check: real ROM size is %u KB (was requesting %u KB) "
+                    "— truncating\n", real_size / 1024, info->rom_size_kb);
+            info->rom_size_kb = real_size / 1024;
+            info->rom_size_confirmed = 1;
+            write_size = real_size;
+        }
+    }
+
+    // rom_cache_dump() (the old-firmware path) always mkdir's roms_dir
+    // before its own fopen() — this path never did, so on a genuinely fresh
+    // install (roms/ never created) every dump here failed at fopen()
+    // regardless of game or size. Confirmed directly: an external tester's
+    // Mario Golf (32MB buffer) and Pokemon Gold (2MB buffer) both hit the
+    // identical "ROM dump complete... SUCCESS" immediately followed by
+    // "[FAIL] ROM dump failed", which only made sense once the missing
+    // mkdir was found — invisible on the developer's own hardware, whose
+    // roms/ directory has existed since long before this function did.
+    char roms_dir[64];
+    snprintf(roms_dir, sizeof(roms_dir), "%s/roms", g_app_root);
+    mkdir(roms_dir, 0755);
+
     build_rom_path_sd(info, rom_path, path_size);
     FILE *f = fopen(rom_path, "wb");
-    if (!f || fwrite(buf, 1, total, f) != total) {
-        if (f) fclose(f);
+    if (!f) {
+        lprintf("[dump] new-protocol: fopen(%s, wb) failed: errno=%d (%s)\n",
+                rom_path, errno, strerror(errno));
+        free(buf);
+        return -1;
+    }
+    size_t written = fwrite(buf, 1, write_size, f);
+    if (written != write_size) {
+        // Captured 100% correctly in RAM (rc==0 above already confirmed a
+        // footer-validated stream) — a short/failed write here is an SD/USB
+        // storage problem (free space, media error, or a libfat limitation
+        // on a single very large fwrite()), not a protocol problem. Never
+        // silently swallowed: this exact failure previously had zero log
+        // output, making a "ROM dump complete — SUCCESS" immediately
+        // followed by "[FAIL] ROM dump failed" look contradictory and
+        // undiagnosable (Save Read Write Test/test_external_1: a 32MB
+        // buffer — 2x any GBA ROM this project had written this way before
+        // — failed to write with no visible cause).
+        lprintf("[dump] new-protocol: fwrite short: wrote %u of %u bytes to %s "
+                "— errno=%d (%s)\n", (unsigned)written, write_size, rom_path, errno, strerror(errno));
+        fclose(f);
         free(buf);
         return -1;
     }

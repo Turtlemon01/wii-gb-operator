@@ -147,6 +147,22 @@ int gbop_dump_rom(GBOperatorHandle handle, const CartInfo *info,
 // the check did not need to run, or aborted on a read error).
 int gbop_verify_gba_rom_size(GBOperatorHandle handle, CartInfo *info, int *out_did_stream);
 
+// Determines a GBA cart's real ROM size from data already captured (no
+// device I/O) by finding the smallest standard candidate boundary S where
+// buf[0:S] == buf[S:2S] exactly (real GBA ROM chips mirror address-wrapped
+// reads past their true physical capacity — see gbop_verify_gba_rom_size()
+// above for the same principle applied to one narrow reported-size case).
+// Candidates checked in increasing order {1,2,4,8,16} MB — real retail GBA
+// carts are always one of these standard sizes (or 32MB, which needs no
+// correction since that's the full captured_len already). captured_len
+// must be >= 2*S for a candidate S to even be checkable, so this only ever
+// returns something <= captured_len/2.
+// Returns 1 and sets *out_real_size_bytes if a boundary was found (safe to
+// truncate to it); 0 if no boundary matched (keep the full captured_len —
+// the cart may genuinely be that large, or non-standard).
+int gbop_detect_gba_mirror_size(const uint8_t *buf, uint32_t captured_len,
+                                 uint32_t *out_real_size_bytes);
+
 // Reads the first 512 bytes of ROM for header identification (title, game code,
 // CGB flag). Must be called on a FRESHLY OPENED handle (gbop_reopen() after
 // gbop_close() on the cart-info handle). Running it on the warm cart-info handle

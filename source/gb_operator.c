@@ -1054,6 +1054,56 @@ int gbop_verify_gba_rom_size(GBOperatorHandle handle, CartInfo *info, int *out_d
     return 0;
 }
 
+// General GBA ROM size detection over an already-captured buffer -----------
+//
+// gbop_verify_gba_rom_size() above only ever checks one narrow case: a
+// cart-info byte pattern suggesting the reported size is exactly 2x too
+// large. It can't help an unrecognized game with no reported size to check
+// against at all — that case currently just requests the generic 32MB
+// fallback (rom_sizes.h) and trusts whatever comes back wholesale.
+//
+// Confirmed on hardware (Save Read Write Test/test_external_1, 2026-08-01):
+// requesting an inflated size against a real, smaller GBA cart makes the
+// device stream (and footer-terminate) at essentially the full requested
+// size, not the cart's true capacity — i.e. the device does not enforce or
+// even seem to know its own true capacity; asking for more just gets you
+// more, with content past the real end being a mirrored repeat (same
+// address-wraparound principle gbop_verify_gba_rom_size() already relies
+// on). This function finds that real boundary directly from data already
+// in RAM — no extra device round-trips — by checking each standard GBA
+// cart size in increasing order for an exact, full-range mirror.
+#define GBOP_MIRROR_CANDIDATE_COUNT 5
+static const uint32_t s_mirror_candidates_kb[GBOP_MIRROR_CANDIDATE_COUNT] = {
+    1024, 2048, 4096, 8192, 16384
+};
+
+int gbop_detect_gba_mirror_size(const uint8_t *buf, uint32_t captured_len,
+                                 uint32_t *out_real_size_bytes) {
+    if (!buf || !out_real_size_bytes) return 0;
+
+    for (int i = 0; i < GBOP_MIRROR_CANDIDATE_COUNT; i++) {
+        uint32_t s = s_mirror_candidates_kb[i] * 1024;
+        if ((uint64_t)s * 2 > captured_len) break; // can't check — not enough captured data
+
+        // Full-range compare, not a small sampled window: the whole buffer
+        // is already in RAM, so this costs nothing meaningful (<1s even for
+        // the largest 16MB candidate) and removes any false-positive risk
+        // from checking only a slice — a strictly more conservative version
+        // of the same mirroring principle gbop_verify_gba_rom_size() above
+        // already relies on in practice.
+        if (memcmp(buf, buf + s, s) == 0) {
+            lprintf("[gbop] Mirror detected at offset 0x%08X (%u KB) — real ROM size is %u KB "
+                    "(captured %u KB)\n", s, s / 1024, s / 1024, captured_len / 1024);
+            *out_real_size_bytes = s;
+            return 1;
+        }
+    }
+
+    lprintf("[gbop] No mirror boundary found in %u KB captured — keeping full size\n",
+            captured_len / 1024);
+    return 0;
+}
+
 /* Removed sd_commit (fclose+fopen) — it stalls USB bulk transfers by 200-500ms,
  * causing the GB Operator to stall the IN endpoint and blocking USB_ReadBlkMsg(60)
  * indefinitely.  fflush is used instead: fast (stdio buffer only, no SD sector

@@ -9,6 +9,13 @@
  * ROM header 0xAC (same convention as gametitles.c). See rom_sizes.h for
  * how these values are used and their confidence caveats.
  *
+ * GBA has no self-describing size field in its header (unlike GB/GBC, see
+ * gb_header_rom_kb()/gb_header_ram_kb() below) — this table plus
+ * gbop_detect_gba_mirror_size()'s hardware mirror-check (gb_operator.c) are
+ * the only two ways to learn a GBA cart's real size without an external
+ * reference. A table hit here is preferred (skips the mirror-check
+ * entirely) but is not required for a dump to come out correctly sized.
+ *
  * Source: No-Intro (https://www.no-intro.org). CONFIRMED entries were read
  * directly off hardware via Wireshark capture or the device's own (old-
  * firmware) size reporting in this project's testing.
@@ -29,58 +36,15 @@ static const struct { char pfx[4]; uint32_t rom_kb; uint32_t ram_kb; } kGBA[] = 
     { "AGF", 8192,  0 },     /* Golden Sun */
     { "AGS", 8192,  0 },     /* Golden Sun: The Lost Age */
     { "B06", 32768, 0 },     /* Mother 3 (Japan only) — largest common GBA cart size */
+    /* Real size given directly by the developer (2026-08-01, in response to
+     * Save Read Write Test/test_external_1: an external tester's Mario Golf
+     * dump was requested at the 32768KB unrecognized-game fallback — 4x too
+     * large — which the ROM-size-doubling investigation elsewhere in this
+     * project suggests the device may actually honor/stream up to, rather
+     * than reject). Not independently re-verified by this project's own
+     * hardware/Wireshark testing. */
+    { "BMG", 8192,  0 },     /* Mario Golf: Advance Tour */
 };
-
-/* ---------------------------------------------------------------------------
- * GBC ROM/RAM size database. Key: first 3 chars of the 4-char CGB code at
- * ROM header 0x13F.
- * --------------------------------------------------------------------------- */
-static const struct { char pfx[4]; uint32_t rom_kb; uint32_t ram_kb; } kGBC[] = {
-    /* Pokemon Gold/Silver — CONFIRMED: Silver read directly off hardware
-     * via Wireshark capture (test v10.0.10, 2026-07-27); Gold shares the
-     * same cart generation/capacity. */
-    { "AAU", 2048, 32 },     /* Pokemon Gold    CONFIRMED (Silver's pair, same gen) */
-    { "AAX", 2048, 32 },     /* Pokemon Silver  CONFIRMED */
-    { "BYT", 2048, 32 },     /* Pokemon Crystal — not independently verified, same gen as G/S */
-};
-
-/* ---------------------------------------------------------------------------
- * Pure (non-Color) Game Boy cart database. Unlike GBA/GBC, a plain DMG cart
- * has no reliable machine-readable code — match_gbc_prefix() below requires
- * the CGB compatibility flag at 0x143, which these carts never set (they
- * predate Game Boy Color entirely), so the code-based lookup always misses
- * for them and previously fell straight to the generic unrecognized-game
- * fallback (8192KB — 8x the real size for Gen 1 Pokemon). Matched by the
- * trimmed title string at header offset 0x134 instead (added 2026-07-31,
- * Detect Cart Test/test_4: Pokemon Red reported as 8192KB/128KB against its
- * real 1024KB/32KB).
- *
- * Source: No-Intro / Pan Docs (MBC3, standard Gen 1 Pokemon cart shape) —
- * not independently hardware-verified via this project's own Wireshark
- * captures the way the GBC Gold/Silver entries above are.
- * --------------------------------------------------------------------------- */
-static const struct { const char *title; uint32_t rom_kb; uint32_t ram_kb; } kGBTitle[] = {
-    { "POKEMON RED",    1024, 32 },
-    { "POKEMON BLUE",   1024, 32 },
-    { "POKEMON GREEN",  1024, 32 },  /* Japan-only Midori/Green */
-    { "POKEMON YELLOW", 1024, 32 },
-};
-
-/* Header title field is 16 bytes at 0x134 (this path is only ever reached
- * for a cart WITHOUT the CGB flag, so the older, full-width field applies —
- * newer carts that shrink it to 15 bytes for the CGB flag byte are handled
- * by the GBC code-based path above instead), null- or space-padded. */
-static int extract_title_trimmed(const uint8_t *hdr, char out[17]) {
-    int len = 0;
-    for (int i = 0; i < 16; i++) {
-        char c = (char)hdr[0x134 + i];
-        if (c == 0x00) break;
-        out[len++] = c;
-    }
-    while (len > 0 && out[len - 1] == ' ') len--;
-    out[len] = '\0';
-    return len;
-}
 
 static int match_gba_prefix(const uint8_t *hdr, char out[4]) {
     for (int i = 0; i < 3; i++) {
@@ -92,58 +56,66 @@ static int match_gba_prefix(const uint8_t *hdr, char out[4]) {
     return 1;
 }
 
-static int match_gbc_prefix(const uint8_t *hdr, char out[4]) {
-    uint8_t cgb = hdr[0x143];
-    if (cgb != 0x80 && cgb != 0xC0) return 0;
-    for (int i = 0; i < 3; i++) {
-        char c = (char)hdr[0x13F + i];
-        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) out[i] = c;
-        else { out[0] = '\0'; return 0; }
-    }
-    out[3] = '\0';
-    return 1;
-}
-
 uint32_t rom_sizes_lookup_rom_kb(CartType type, const uint8_t *hdr) {
-    if (!hdr) return 0;
+    if (!hdr || type != CART_TYPE_GBA) return 0;
     char pfx[4];
-    if (type == CART_TYPE_GBA) {
-        if (!match_gba_prefix(hdr, pfx)) return 0;
-        for (size_t i = 0; i < ARRAY_LEN(kGBA); i++)
-            if (strcmp(kGBA[i].pfx, pfx) == 0) return kGBA[i].rom_kb;
-        return 0;
-    }
-    if (match_gbc_prefix(hdr, pfx)) {
-        for (size_t i = 0; i < ARRAY_LEN(kGBC); i++)
-            if (strcmp(kGBC[i].pfx, pfx) == 0) return kGBC[i].rom_kb;
-        return 0;
-    }
-    /* No CGB flag — a plain DMG cart, which never has a code-based match.
-     * Fall back to a title match instead of the generic 8192KB guess. */
-    char title[17];
-    extract_title_trimmed(hdr, title);
-    for (size_t i = 0; i < ARRAY_LEN(kGBTitle); i++)
-        if (strcmp(kGBTitle[i].title, title) == 0) return kGBTitle[i].rom_kb;
+    if (!match_gba_prefix(hdr, pfx)) return 0;
+    for (size_t i = 0; i < ARRAY_LEN(kGBA); i++)
+        if (strcmp(kGBA[i].pfx, pfx) == 0) return kGBA[i].rom_kb;
     return 0;
 }
 
 uint32_t rom_sizes_lookup_ram_kb(CartType type, const uint8_t *hdr) {
-    if (!hdr) return 0;
+    if (!hdr || type != CART_TYPE_GBA) return 0;
     char pfx[4];
-    if (type == CART_TYPE_GBA) {
-        if (!match_gba_prefix(hdr, pfx)) return 0;
-        for (size_t i = 0; i < ARRAY_LEN(kGBA); i++)
-            if (strcmp(kGBA[i].pfx, pfx) == 0) return kGBA[i].ram_kb;
-        return 0;
-    }
-    if (match_gbc_prefix(hdr, pfx)) {
-        for (size_t i = 0; i < ARRAY_LEN(kGBC); i++)
-            if (strcmp(kGBC[i].pfx, pfx) == 0) return kGBC[i].ram_kb;
-        return 0;
-    }
-    char title[17];
-    extract_title_trimmed(hdr, title);
-    for (size_t i = 0; i < ARRAY_LEN(kGBTitle); i++)
-        if (strcmp(kGBTitle[i].title, title) == 0) return kGBTitle[i].ram_kb;
+    if (!match_gba_prefix(hdr, pfx)) return 0;
+    for (size_t i = 0; i < ARRAY_LEN(kGBA); i++)
+        if (strcmp(kGBA[i].pfx, pfx) == 0) return kGBA[i].ram_kb;
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * GB/GBC: real ROM/RAM size read directly from the cartridge header, not a
+ * curated table. Standard Game Boy header fields (Pan Docs "The Cartridge
+ * Header"): ROM size code at 0x148, RAM size code at 0x149. Both offsets
+ * fall inside the header checksum range (0x134-0x14C) that
+ * header_checksum_valid() (gb_operator.c) already requires to pass before
+ * any header buffer is trusted — so these values are exact for every real
+ * GB/GBC cart, not a guess limited to whatever games happen to be in a
+ * table. Replaces the old kGBC[]/kGBTitle[] curated-table approach entirely
+ * (2026-08-01, prompted by an external tester's Pokemon Gold/Super Mario
+ * Land reports — a plain DMG cart like Super Mario Land was never going to
+ * fit a curated table, and previously fell to the generic 8192KB/128KB
+ * fallback: 128x the real ROM size and, critically, a wrongly-assumed save
+ * chip on a cart that has none at all).
+ * --------------------------------------------------------------------------- */
+uint32_t gb_header_rom_kb(const uint8_t *hdr) {
+    if (!hdr) return 0;
+    switch (hdr[0x148]) {
+        case 0x00: return 32;
+        case 0x01: return 64;
+        case 0x02: return 128;
+        case 0x03: return 256;
+        case 0x04: return 512;
+        case 0x05: return 1024;
+        case 0x06: return 2048;
+        case 0x07: return 4096;
+        case 0x08: return 8192;
+        case 0x52: return 1152;
+        case 0x53: return 1280;
+        case 0x54: return 1536;
+        default:   return 0; /* unrecognized code — a real cart is never 0 KB */
+    }
+}
+
+uint32_t gb_header_ram_kb(const uint8_t *hdr) {
+    if (!hdr) return UINT32_MAX;
+    switch (hdr[0x149]) {
+        case 0x00: return 0;    /* no save RAM — a real, common, correct answer */
+        case 0x02: return 8;
+        case 0x03: return 32;
+        case 0x04: return 128;
+        case 0x05: return 64;
+        default:   return UINT32_MAX; /* unrecognized — caller treats as unknown */
+    }
 }
