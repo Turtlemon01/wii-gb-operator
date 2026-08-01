@@ -2,7 +2,7 @@
 <app version="1">
     <name>Wii GB Operator</name>
     <coder>Turtlemon + Claude Code</coder>
-    <version>1.1.0</version>
+    <version>1.1.1</version>
     <release_date>20260801</release_date>
     <short_description>Play GB/GBC/GBA carts via Epilogue GB Operator</short_description>
     <long_description>Read GB, GBC, and GBA cartridges from the Epilogue GB Operator over USB. Dumps ROMs to SD on first play, syncs save data to the cartridge in the background, and launches games in an integrated mGBA emulator. Supports custom GBc/A border art and animated sync icons.</long_description>
