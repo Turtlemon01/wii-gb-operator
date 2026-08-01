@@ -24,7 +24,23 @@
 #define SUCCESS_DISPLAY_FRAMES 120
 
 static const CartInfo    *s_info       = NULL;
-static uint8_t           *s_buf        = NULL;
+// Two separate buffers, not one, to close a real data race (found 2026-08-01):
+// s_xmit_buf is read by gbop_write_save() for the ENTIRE duration of a write —
+// which can legitimately take many seconds (128KB GBA Flash in 64-byte USB
+// chunks) or, on a bad connection, much longer across retries — and that read
+// was never protected by s_mutex. cart_sync_queue() runs on the main thread
+// (from on_save_data_updated, which can fire again mid-transfer on any further
+// SRAM/Flash write) and used to memcpy directly into the SAME buffer the sync
+// thread was actively streaming from, under the mutex on the writer side only —
+// the reader (gbop_write_save) never checked the mutex, so a concurrent queue
+// call could tear the buffer mid-transmission and send a corrupted mix of two
+// different save states to the physical cartridge. Fix: cart_sync_queue()
+// always writes into s_pending_buf (a separate staging area); the sync thread
+// copies s_pending_buf -> s_xmit_buf (a quick, mutex-protected memcpy) only
+// once, right before starting a fresh write attempt, and s_xmit_buf is never
+// touched by anything else while a write (or its retries) is in flight.
+static uint8_t           *s_xmit_buf    = NULL;
+static uint8_t           *s_pending_buf = NULL;
 static uint32_t           s_buf_size   = 0;
 static char               s_save_path[256] = {0};
 static void (*s_on_sync_success_cb)(const void *buf, uint32_t sz) = NULL;
@@ -69,6 +85,13 @@ static void *sync_thread_func(void *arg) {
         LWP_MutexLock(s_mutex);
         int has_data = s_pending;
         s_pending = 0;
+        // Snapshot the latest queued save into s_xmit_buf HERE, under the mutex,
+        // and only here — this is the one moment s_xmit_buf is mutated. From this
+        // point until the write (and any retries) finishes, s_xmit_buf is stable;
+        // a concurrent cart_sync_queue() call during that window only ever touches
+        // s_pending_buf, never this one. See the s_xmit_buf/s_pending_buf comment
+        // near their declarations for the race this closes.
+        if (has_data) memcpy(s_xmit_buf, s_pending_buf, s_buf_size);
         LWP_MutexUnlock(s_mutex);
 
         if (!has_data) continue;
@@ -79,7 +102,7 @@ static void *sync_thread_func(void *arg) {
         while (!ok && !s_shutdown) {
             GBOperatorHandle op = gbop_reopen();
             if (op) {
-                int r = gbop_write_save(op, s_info, s_buf, s_buf_size);
+                int r = gbop_write_save(op, s_info, s_xmit_buf, s_buf_size);
                 gbop_close(op);
                 if (r == 0) {
                     ok = 1;
@@ -102,7 +125,7 @@ static void *sync_thread_func(void *arg) {
             /* Notify frontend of successful write (updates snapshot, sets saved flag).
              * Called even during shutdown so s_player_saved_ingame is set correctly. */
             if (s_on_sync_success_cb)
-                s_on_sync_success_cb(s_buf, s_buf_size);
+                s_on_sync_success_cb(s_xmit_buf, s_buf_size);
 
             /* SD write: skip if shutdown is in progress.
              * When the main thread calls cart_sync_shutdown(), it sets s_shutdown=1 then
@@ -114,7 +137,7 @@ static void *sync_thread_func(void *arg) {
             if (!s_shutdown && s_save_path[0]) {
                 FILE *sf = fopen(s_save_path, "wb");
                 if (sf) {
-                    size_t written = fwrite(s_buf, 1, s_buf_size, sf);
+                    size_t written = fwrite(s_xmit_buf, 1, s_buf_size, sf);
                     fclose(sf);
                     lprintf("[sync] SD save written: %zu / %u bytes → %s\n",
                             written, s_buf_size, s_save_path);
@@ -155,7 +178,8 @@ void cart_sync_init(const CartInfo *info, const char *save_path,
                     void (*on_sync_success)(const void *buf, uint32_t sz)) {
     s_info        = info;
     s_buf_size    = info->ram_size_kb * 1024;
-    s_buf         = (uint8_t *)malloc(s_buf_size);
+    s_xmit_buf    = (uint8_t *)malloc(s_buf_size);
+    s_pending_buf = (uint8_t *)malloc(s_buf_size);
     s_state       = CART_SYNC_IDLE;
     s_pending     = 0;
     s_shutdown    = 0;
@@ -178,11 +202,42 @@ void cart_sync_init(const CartInfo *info, const char *save_path,
 }
 
 void cart_sync_queue(const void *buf, uint32_t size) {
-    if (!s_buf || size != s_buf_size) return;
+    if (!s_pending_buf) return;
+    if (size != s_buf_size) {
+        // Previously a silent no-op — a real, silent-failure gap. Every call
+        // site clamps its own upload size to <= s_buf_size before calling this
+        // (see mgba_frontend.c), so the only way to land here is the clone
+        // coming back SMALLER than info->ram_size_kb*1024 (e.g. a save-size
+        // mismatch between this project's own detection and mGBA's). That's
+        // worth knowing about, not swallowing silently.
+        lprintf("[sync] cart_sync_queue: size mismatch (%u != %u) — dropping\n", size, s_buf_size);
+        return;
+    }
     LWP_MutexLock(s_mutex);
-    memcpy(s_buf, buf, size);
+    memcpy(s_pending_buf, buf, size);
     s_pending = 1;
     LWP_MutexUnlock(s_mutex);
+    // Set state to IN_PROGRESS HERE, synchronously on the caller's thread —
+    // not left for the sync thread to do once it gets scheduled. Confirmed
+    // real bug (Save Read Write Test/test_3, 2026-08-01): cart_sync_state()
+    // stayed IDLE for a real, measurable window after this function returned
+    // (the sync thread hadn't been scheduled yet to consume the semaphore
+    // post and flip state itself), and the OSD's "Sync & Exit" wait loop
+    // polls cart_sync_state() immediately after queuing — seeing IDLE, it
+    // treated a genuinely-still-pending job as "nothing to wait for" and
+    // exited after a single frame, letting teardown call
+    // cart_sync_shutdown() moments later. That function sets its own
+    // shutdown flag and wakes the thread; the thread woke up, saw shutdown
+    // already requested, and exited WITHOUT EVER attempting the queued
+    // write — confirmed directly from the log: no "state: IDLE →
+    // IN_PROGRESS", no "Save write start", nothing between the queue and
+    // the thread joining "cleanly" ~54ms later. The player's final,
+    // pre-exit save was silently discarded. s_state has no dedicated lock
+    // (already true before this fix — cart_sync_state() reads it directly),
+    // so writing it from this thread too is no less safe than before; it
+    // just closes the visibility window instead of leaving it to a
+    // thread-scheduling race.
+    set_state(CART_SYNC_IN_PROGRESS);
     LWP_SemPost(s_sem);
     lprintf("[sync] Save queued\n");
 }
@@ -237,15 +292,22 @@ void cart_sync_shutdown(void) {
         LWP_SemDestroy(s_sem);
         LWP_MutexDestroy(s_mutex);
         lprintf("[sync] Cart sync thread joined cleanly\n");
-        free(s_buf);
-        s_buf = NULL;
+        free(s_xmit_buf);
+        free(s_pending_buf);
+        s_xmit_buf = NULL;
+        s_pending_buf = NULL;
     } else {
         lprintf("[sync] Cart sync thread did not exit within timeout — abandoning\n");
-        /* Do NOT destroy mutex/semaphore or free s_buf: thread is still blocked
-         * in USB_ReadBlkMsg and may access s_buf when IOS eventually returns.
-         * Freeing s_buf here causes a use-after-free crash when USB unblocks.
-         * Intentional memory leak: app exits immediately after. */
-        s_buf = NULL;  /* null our pointer so cart_sync_queue is a no-op from now on */
+        /* Do NOT destroy mutex/semaphore or free s_xmit_buf: the thread is still
+         * blocked in USB_ReadBlkMsg and may access s_xmit_buf when IOS eventually
+         * returns. Freeing it here causes a use-after-free crash when USB
+         * unblocks. Intentional leak: app exits immediately after.
+         * s_pending_buf is different — the thread never touches it once it has
+         * copied it into s_xmit_buf (see sync_thread_func), so it's safe to
+         * free now; nulling it also makes cart_sync_queue() a no-op from here on. */
+        free(s_pending_buf);
+        s_pending_buf = NULL;
+        s_xmit_buf = NULL;  /* leaked deliberately — see comment above; just drop our pointer */
     }
 
     s_thread = LWP_THREAD_NULL;

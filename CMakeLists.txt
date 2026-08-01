@@ -181,12 +181,14 @@ add_executable(wii_gb_operator
     source/main.c
     source/gb_operator.c
     source/rom_cache.c
+    source/rom_reconcile.c
     source/mgba_frontend.c
     source/cart_sync.c
     source/dol_reload.c
     source/settings.c
     source/cartindex.c
     source/gametitles.c
+    source/rom_sizes.c
 )
 
 target_include_directories(wii_gb_operator PRIVATE

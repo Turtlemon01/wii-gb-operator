@@ -21,3 +21,16 @@ logs/
 # Unmanaged large directories
 vendor/
 sprites/
+
+# Copyrighted ROMs, save dumps, and third-party proprietary tooling (Epilogue
+# Playback) captured during development/testing — must never reach the
+# public repo.
+dumps/
+
+# Third-party reference art (Spriters Resource, MiSTer border packs, etc.)
+# gathered while designing borders — reference material only, not shipped
+# assets, and not ours to redistribute.
+borders/*/reference/
+
+# Build output binary — attach to GitHub Releases instead of committing.
+*.dol

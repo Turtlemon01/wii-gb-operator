@@ -1,6 +1,7 @@
 #pragma once
 #include <stdio.h>
 #include <stdarg.h>
+#include <ogc/lwp_watchdog.h>
 
 /* Current log file path — set by main.c after log rotation.
  * Used by log_commit_sd() to reopen the correct file after fclose. */
@@ -18,14 +19,30 @@ extern int g_log_suppress_console;
  * All modules derive their file paths from this. */
 extern char g_app_root[32];
 
+/* gettime() captured once at the very start of main(), before anything else
+ * runs. Every lprintf() line is prefixed with elapsed time since this point
+ * (see below) so a future hardware log can be compared directly against the
+ * Wireshark captures in CLAUDE.md ("Firmware-V10_0_10-WireShark") — e.g.
+ * Epilogue Playback's own cart-info round trip is a consistent ~600-700us
+ * there. Without a reference point on the Wii side there was previously no
+ * way to tell whether a given attempt's actual USB round-trip time looks
+ * anything like that, or is much slower — a real, testable explanation for
+ * why the same device/cart that Epilogue reads reliably on nearly every
+ * poll fails most attempts here (Post Firmware Update Test/test_6 through
+ * test_10 confirmed the device itself is not the problem). */
+extern u64 g_log_t0;
+
 static inline void lprintf(const char *fmt, ...) {
     va_list args;
+    u64 us = ticks_to_microsecs(gettime() - g_log_t0);
     if (!g_log_suppress_console) {
+        printf("[%6llu.%03llums] ", (unsigned long long)(us / 1000), (unsigned long long)(us % 1000));
         va_start(args, fmt);
         vprintf(fmt, args);
         va_end(args);
     }
     if (g_log) {
+        fprintf(g_log, "[%6llu.%03llums] ", (unsigned long long)(us / 1000), (unsigned long long)(us % 1000));
         va_start(args, fmt);
         vfprintf(g_log, fmt, args);
         va_end(args);

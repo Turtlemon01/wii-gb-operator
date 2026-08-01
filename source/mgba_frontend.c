@@ -675,12 +675,25 @@ static void draw_save_indicator(void) {
     if (s_save_ok_timer > 0) {
         icon_idx = 2; /* sync_done */
         s_save_ok_timer--;
-    } else if (st == CART_SYNC_IN_PROGRESS) {
+    } else if (st == CART_SYNC_IN_PROGRESS || st == CART_SYNC_FAILED) {
+        // FAILED means "actively retrying in the background" (see
+        // cart_sync.h), not "stopped" — cart_sync.c's write-retry loop keeps
+        // going indefinitely with a 3s delay between attempts. Confirmed on
+        // hardware (Save Read Write Test/test_4) that a real GBA auto-sync
+        // spends the overwhelming majority of its wall-clock duration in
+        // FAILED, not IN_PROGRESS — one logged sync was IN_PROGRESS for
+        // ~19.5ms (the first attempt failing almost immediately) and FAILED
+        // for the following ~16 SECONDS while the retry loop actually
+        // streamed the save. Freezing the icon at a static frame during
+        // FAILED (the previous behavior) meant the animation was visible for
+        // well under 1% of a typical sync's real duration — indistinguishable
+        // from "the indicator doesn't cycle" to a player watching it, which
+        // is exactly what was reported. Animate through FAILED the same as
+        // IN_PROGRESS so the icon keeps moving for the entire time a sync is
+        // genuinely still being attempted.
         s_anim_timer++;
         if (s_anim_timer >= 30) { s_anim_timer = 0; s_anim_frame ^= 1; }
         icon_idx = s_anim_frame; /* 0 or 1 */
-    } else if (st == CART_SYNC_FAILED) {
-        icon_idx = 0; /* static frame 0 for failed — no animation */
     } else {
         s_anim_timer = 0;
         s_anim_frame = 0;
@@ -794,13 +807,26 @@ static void osd_draw_syncing_exit(CartSyncState st) {
         printf("Sync complete!\n\n");
     else
         printf("Sync failed — save is on SD.\n\n");
-    printf("Please wait...\n");
+    printf("Please wait... (hold B to skip)\n");
 }
 
 static void osd_show(void) {
+    // Diagnostic timing added 2026-07-29 in response to a direct report:
+    // "when i press z to open the menu it prevents me from moving the
+    // cursor to exit" — happens on Z press alone, before Sync & Exit is
+    // ever selected, so it isn't the cart_sync_state() polling loop (that
+    // code path is never reached). Nothing in this function's setup (audio
+    // stop, GX_DrawDone, console/video reconfigure, Z-release wait) should
+    // normally take more than a frame or two, but none of it was ever
+    // measured on real hardware. Logging entry/exit timestamps around each
+    // step, plus every UP/DOWN scan result in the main loop below, so the
+    // next hardware log shows exactly where the delay actually is instead
+    // of guessing a second time.
+    lprintf("[osd] show: enter\n");
     AUDIO_StopDMA();
 
     GX_DrawDone();
+    lprintf("[osd] show: GX_DrawDone returned\n");
     VIDEO_WaitVSync();
     console_init(xfb, 20, 20, rmode->fbWidth, rmode->xfbHeight,
                  rmode->fbWidth * VI_DISPLAY_PIX_SZ);
@@ -808,12 +834,16 @@ static void osd_show(void) {
     VIDEO_SetNextFramebuffer(xfb);
     VIDEO_Flush();
     VIDEO_WaitVSync();
+    lprintf("[osd] show: video reconfigured\n");
 
     /* Wait for Z release to avoid immediate re-trigger */
+    int z_wait_frames = 0;
     while (PAD_ButtonsHeld(0) & PAD_TRIGGER_Z) {
         PAD_ScanPads();
         VIDEO_WaitVSync();
+        z_wait_frames++;
     }
+    if (z_wait_frames > 0) lprintf("[osd] show: Z release wait took %d frame(s)\n", z_wait_frames);
 
     int  item         = 0;
     bool running      = true;
@@ -824,10 +854,15 @@ static void osd_show(void) {
     bool gba_mode     = (s_info && s_info->type == CART_TYPE_GBA);
 
     osd_draw(item);
+    lprintf("[osd] show: main loop entered, first draw done\n");
 
+    int loop_frame = 0;
     while (running) {
         PAD_ScanPads();
         u16 pressed = PAD_ButtonsDown(0);
+        if (pressed) lprintf("[osd] show: frame %d pressed=0x%04X item=%d in_exit_menu=%d\n",
+                             loop_frame, pressed, item, in_exit_menu);
+        loop_frame++;
         bool need_redraw = false;
 
         if (in_exit_menu) {
@@ -853,15 +888,48 @@ static void osd_show(void) {
                         }
                         if (rawsave) free(rawsave);
                     }
-                    /* Poll sync state with timeout */
+                    /* Poll sync state with timeout. This loop previously
+                     * never called PAD_ScanPads() at all — controls were
+                     * completely unresponsive for up to the full ~10s
+                     * timeout with no way to interrupt it, which is exactly
+                     * the "controls blocked in the Z menu" symptom reported
+                     * directly (2026-07-29). Fixed: scan every iteration and
+                     * let the player hold B to bail out early. Safe to leave
+                     * before the cart write finishes — s_player_saved_ingame
+                     * is already set (just above), so mgba_run()'s teardown
+                     * failsafe still writes the save to SD regardless of
+                     * whether this wait completes, and the cart_sync
+                     * background thread keeps retrying independently (it's
+                     * only stopped later, by cart_sync_shutdown()'s own
+                     * bounded timeout during teardown) — bailing here just
+                     * means the player doesn't wait around for the cart-side
+                     * confirmation, not that the sync itself is cancelled. */
                     int timeout = 600;  /* ~10 s at 60 fps */
                     CartSyncState st;
+                    bool skipped = false;
                     do {
                         st = cart_sync_state();
                         osd_draw_syncing_exit(st);
                         VIDEO_Flush();
                         VIDEO_WaitVSync();
-                    } while (st == CART_SYNC_IN_PROGRESS && --timeout > 0);
+                        PAD_ScanPads();
+                        if (PAD_ButtonsHeld(0) & PAD_BUTTON_B) { skipped = true; break; }
+                        // FAILED means "still retrying in the background" (see
+                        // cart_sync.h), not "stopped" — treating it as a reason
+                        // to stop waiting let this loop exit after the very
+                        // first (often near-instant) failed attempt, well
+                        // before the retry loop's later attempts had any
+                        // chance to actually complete. Confirmed on hardware
+                        // (Save Read Write Test/test_4): a queued "Sync &
+                        // Exit" flipped IN_PROGRESS → FAILED within ~19.5ms of
+                        // being queued, and this loop exited immediately after
+                        // — teardown then shut the sync thread down before it
+                        // ever got to its second, successful attempt (which
+                        // took ~16 more seconds). Keep waiting through FAILED
+                        // too; only SUCCESS (or the timeout, or the player
+                        // holding B) should end this wait.
+                    } while ((st == CART_SYNC_IN_PROGRESS || st == CART_SYNC_FAILED) && --timeout > 0);
+                    if (skipped) lprintf("[osd] Sync & Exit wait skipped by user (sync continues in background)\n");
                     do_quit = true;
                     running = false;
                 } else if (exit_item == 1) {
@@ -1148,13 +1216,29 @@ int mgba_run(const CartInfo *info, const char *rom_path, const char *save_path,
      * for the first 300 frames (~5 s) so only the game area is visible. */
     s_sgb_suppress_border = (has_sgb && !is_cgb) ? 300 : 0;
 
-    /* Custom border for CGB+SGB games (Silver, Gold, Crystal, etc.).
+    /* Custom border for CGB games (Silver, Gold, Crystal, etc.).
      * File: sd:/apps/wii-gb-operator/borders/gbc/border_CODE.bmp
      * Must be 256×224 pixels, 24 or 32-bit BMP.
-     * When loaded, the 160×144 CGB game is composited into the centre each frame. */
+     * When loaded, the 160×144 CGB game is composited into the centre each frame.
+     *
+     * Gated on is_cgb alone — NOT has_sgb. Originally gated on both, which broke
+     * this entirely for the Korean release of Pokémon Gold/Silver (reported
+     * 2026-08-01: border_AAXK.bmp present and correctly named, but never loaded,
+     * while the US Gold/Silver borders worked fine). The Korean localization of
+     * Gold/Silver does not set the SGB-compatible flag in its ROM header that
+     * the US/JP/EU releases do, so has_sgb was false and this whole block was
+     * skipped before it ever looked for the file. has_sgb was only ever needed
+     * to identify the *other* branch above (pure-SGB, non-CGB games like Blue,
+     * which use mGBA's own native SGB border instead) — it was never actually
+     * required to gate this custom composited border, since is_cgb alone
+     * already identifies "this is a color game a border image could apply to."
+     * A CGB game with no matching border_CODE.bmp on SD still degrades
+     * gracefully (load_border_bmp returns NULL, s_border_active stays false),
+     * exactly as before — this change only stops excluding CGB games whose ROM
+     * happens not to declare SGB compatibility. */
     if (s_border_buf) { free(s_border_buf); s_border_buf = NULL; }
     s_border_active = false;
-    if (has_sgb && is_cgb && rom_data && rom_len >= 0x144) {
+    if (is_cgb && rom_data && rom_len >= 0x144) {
         /* Game code: ROM header bytes 0x13F–0x142 (4 uppercase ASCII chars).
          * Border file: sd:/apps/wii-gb-operator/borders/gbc/border_AAXE.bmp */
         char game_code[5] = {0};

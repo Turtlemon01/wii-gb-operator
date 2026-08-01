@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-WiiGBSettings g_settings = { .scale_gba = 0.8f, .scale_gba_border = 1.0f, .scale_gb = 0.8f, .dev_menu = 0 };
+WiiGBSettings g_settings = { .scale_gba = 0.8f, .scale_gba_border = 1.0f, .scale_gb = 0.8f, .dev_menu = 0, .use_old_firmware = 0, .auto_detect_cart = 0 };
 
 void settings_load(void) {
     char settings_path[64];
@@ -40,6 +40,30 @@ void settings_load(void) {
                 lprintf("[settings] dev_menu=%d\n", (int)v);
             } else {
                 lprintf("[settings] dev_menu: invalid value '%s', using default\n", val);
+            }
+            continue;
+        }
+
+        if (strcmp(key, "use_old_firmware") == 0) {
+            char *end;
+            long v = strtol(val, &end, 10);
+            if (end != val) {
+                g_settings.use_old_firmware = (int)v;
+                lprintf("[settings] use_old_firmware=%d\n", (int)v);
+            } else {
+                lprintf("[settings] use_old_firmware: invalid value '%s', using default\n", val);
+            }
+            continue;
+        }
+
+        if (strcmp(key, "auto_detect_cart") == 0) {
+            char *end;
+            long v = strtol(val, &end, 10);
+            if (end != val) {
+                g_settings.auto_detect_cart = (int)v;
+                lprintf("[settings] auto_detect_cart=%d\n", (int)v);
+            } else {
+                lprintf("[settings] auto_detect_cart: invalid value '%s', using default\n", val);
             }
             continue;
         }
